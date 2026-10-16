@@ -3,9 +3,12 @@
 //! Every check is pure: it reads the setup document and its params and never touches the
 //! machine. Ids, docs, messages, evidence strings and the pass/warn/fail rules match the
 //! reference word for word, including the way JavaScript renders an absent value
-//! (`undefined`) inside a message. One deliberate difference: a list param written as a single
-//! scalar (`servers: work`) counts as a one-item list, where the reference would iterate the
-//! string's characters.
+//! (`undefined`) inside a message.
+//!
+//! List params: an absent one is an empty list. One set to null fails the check with
+//! `check crashed: <param> is null`, as the reference crashed on it. One deliberate
+//! difference: a list param written as a single scalar (`servers: work`) counts as a one-item
+//! list, where the reference would iterate the string's characters.
 
 use super::{Check, CheckCtx, CheckResult};
 use crate::secrets::find_secrets;
@@ -13,10 +16,15 @@ use crate::util::{arr, expand_home, get_path, glob_to_regex, is_truthy, str_list
 use crate::Doc;
 use regex::Regex;
 use serde_json::Value;
+use std::cell::OnceCell;
 use std::collections::HashSet;
 use std::sync::OnceLock;
 
-type RunFn = fn(&Doc, &Doc, &CheckCtx) -> CheckResult;
+/// Why a check could not run; reported as `check crashed: <why>`, as the reference engine
+/// reported a check that threw.
+struct Crash(String);
+
+type RunFn = fn(&Doc, &Doc, &CheckCtx) -> Result<CheckResult, Crash>;
 
 /// Id, doc and implementation of every built-in check, in the reference's order.
 const BUILTINS: [(&str, &str, RunFn); 9] = [
@@ -81,7 +89,9 @@ impl Check for Builtin {
         self.doc
     }
     fn run(&self, setup: &Doc, params: &Doc, ctx: &CheckCtx) -> CheckResult {
-        (self.run)(setup, params, ctx)
+        (self.run)(setup, params, ctx).unwrap_or_else(|Crash(why)| {
+            CheckResult::fail(format!("check crashed: {why}"), Vec::new())
+        })
     }
 }
 
@@ -147,12 +157,14 @@ fn is_str(v: Option<&Doc>, want: &str) -> bool {
     v.and_then(Value::as_str) == Some(want)
 }
 
-/// A list param. Absent or null is empty; a single scalar counts as a one-item list.
-fn param_list<'a>(params: &'a Doc, key: &str) -> Vec<&'a Doc> {
+/// A list param. Absent is empty and null is a crash, as in the reference (whose defaults
+/// applied only to absent keys); a single scalar counts as a one-item list.
+fn param_list<'a>(params: &'a Doc, key: &str) -> Result<Vec<&'a Doc>, Crash> {
     match params.get(key) {
-        None | Some(Value::Null) => Vec::new(),
-        Some(Value::Array(a)) => a.iter().collect(),
-        Some(other) => vec![other],
+        None => Ok(Vec::new()),
+        Some(Value::Null) => Err(Crash(format!("{key} is null"))),
+        Some(Value::Array(a)) => Ok(a.iter().collect()),
+        Some(other) => Ok(vec![other]),
     }
 }
 
@@ -195,25 +207,87 @@ pub fn is_active_channel(c: &Doc) -> bool {
         && !inactive_re().is_match(first_role)
 }
 
+/// A `*` glob, matched exactly as `util::glob_to_regex` matches it: the whole string,
+/// case-insensitively, with `*` never crossing a newline. Build it once per list entry. ASCII
+/// text is matched directly; anything else falls back to a regex, compiled at most once.
+struct Glob<'a> {
+    text: &'a str,
+    parts: Vec<&'a str>,
+    ascii: bool,
+    regex: OnceCell<Regex>,
+}
+
+impl<'a> Glob<'a> {
+    fn new(text: &'a str) -> Self {
+        Glob {
+            text,
+            parts: text.split('*').collect(),
+            ascii: text.is_ascii(),
+            regex: OnceCell::new(),
+        }
+    }
+
+    fn is_match(&self, s: &str) -> bool {
+        if self.ascii && s.is_ascii() && !s.contains('\n') {
+            ascii_glob_match(&self.parts, s.as_bytes())
+        } else {
+            self.regex
+                .get_or_init(|| glob_to_regex(self.text))
+                .is_match(s)
+        }
+    }
+}
+
+/// Whole-string, ASCII case-insensitive match of a glob split on `*`.
+fn ascii_glob_match(parts: &[&str], s: &[u8]) -> bool {
+    let first = parts[0].as_bytes();
+    if parts.len() == 1 {
+        return s.eq_ignore_ascii_case(first);
+    }
+    let last = parts[parts.len() - 1].as_bytes();
+    if s.len() < first.len() + last.len()
+        || !s[..first.len()].eq_ignore_ascii_case(first)
+        || !s[s.len() - last.len()..].eq_ignore_ascii_case(last)
+    {
+        return false;
+    }
+    // Taking each middle part at its leftmost place leaves the most room for the rest.
+    let mut rest = &s[first.len()..s.len() - last.len()];
+    for part in &parts[1..parts.len() - 1] {
+        let p = part.as_bytes();
+        let starts = (rest.len() + 1).saturating_sub(p.len());
+        match (0..starts).find(|&i| rest[i..i + p.len()].eq_ignore_ascii_case(p)) {
+            Some(i) => rest = &rest[i + p.len()..],
+            None => return false,
+        }
+    }
+    true
+}
+
 /// Is `pattern` covered by some entry of `list`: equal to it, or matched by an entry that is a
 /// broader glob?
-fn covered(pattern: &str, list: &[String]) -> bool {
+fn covered(pattern: &str, list: &[Glob]) -> bool {
     let probe = pattern.replace('*', "x");
-    list.iter()
-        .any(|e| e == pattern || glob_to_regex(e).is_match(&probe))
+    list.iter().any(|g| g.text == pattern || g.is_match(&probe))
 }
 
 // ---- the checks
 
-fn deny_mcp(setup: &Doc, params: &Doc, _ctx: &CheckCtx) -> CheckResult {
-    let servers = param_list(params, "servers");
-    let patterns: Vec<String> = param_list(params, "tool_patterns")
+fn deny_mcp(setup: &Doc, params: &Doc, _ctx: &CheckCtx) -> Result<CheckResult, Crash> {
+    let servers = param_list(params, "servers")?;
+    let patterns: Vec<String> = param_list(params, "tool_patterns")?
         .into_iter()
         .map(|p| js(Some(p)))
         .collect();
     let denied = arr(get_path(setup, "tools.denied_mcp_servers"));
     let deny = str_list(get_path(setup, "tools.permissions.deny"));
+    let deny_globs: Vec<Glob> = deny.iter().map(|e| Glob::new(e)).collect();
     let allow = str_list(get_path(setup, "tools.permissions.allow"));
+    // An `mcp__` allow entry is also read as a glob; built once, outside the pattern loop.
+    let allow_globs: Vec<(&str, Option<Glob>)> = allow
+        .iter()
+        .map(|a| (a.as_str(), a.starts_with("mcp__").then(|| Glob::new(a))))
+        .collect();
     let defined = arr(get_path(setup, "tools.mcp_servers"));
     let (mut bad, mut notes) = (Vec::new(), Vec::new());
     for &server in &servers {
@@ -245,18 +319,18 @@ fn deny_mcp(setup: &Doc, params: &Doc, _ctx: &CheckCtx) -> CheckResult {
     }
     let mut dead = Vec::new();
     for p in &patterns {
-        let is_denied = covered(p, &deny);
+        let is_denied = covered(p, &deny_globs);
         if !is_denied {
             bad.push(format!("tool pattern {p} missing from permissions.deny"));
         }
-        let narrow = glob_to_regex(p);
+        let narrow = Glob::new(p);
         let probe = p.replace('*', "x");
-        let hits: Vec<&str> = allow
+        let hits: Vec<&str> = allow_globs
             .iter()
-            .map(String::as_str)
-            .filter(|a| {
-                narrow.is_match(a) || (a.starts_with("mcp__") && glob_to_regex(a).is_match(&probe))
+            .filter(|(a, broad)| {
+                narrow.is_match(a) || broad.as_ref().is_some_and(|g| g.is_match(&probe))
             })
+            .map(|(a, _)| *a)
             .collect();
         if hits.is_empty() {
             continue;
@@ -274,7 +348,7 @@ fn deny_mcp(setup: &Doc, params: &Doc, _ctx: &CheckCtx) -> CheckResult {
     }
     if !bad.is_empty() {
         let msg = format!("{} way(s) the denied MCP surface is reachable", bad.len());
-        return CheckResult::fail(msg, [bad, notes, dead].concat());
+        return Ok(CheckResult::fail(msg, [bad, notes, dead].concat()));
     }
     let msg = format!(
         "{} server(s) blocked, {} tool pattern(s) denied",
@@ -282,14 +356,14 @@ fn deny_mcp(setup: &Doc, params: &Doc, _ctx: &CheckCtx) -> CheckResult {
         patterns.len()
     );
     if dead.is_empty() {
-        CheckResult::pass(msg, notes)
+        Ok(CheckResult::pass(msg, notes))
     } else {
         let msg = format!(
             "{msg}; {} dead allow {} to clean up",
             dead.len(),
             entries(dead.len())
         );
-        CheckResult::warn(msg, [dead, notes].concat())
+        Ok(CheckResult::warn(msg, [dead, notes].concat()))
     }
 }
 
@@ -317,14 +391,14 @@ const PAYMENT_WORDS: [&str; 21] = [
     "top-up",
 ];
 
-fn no_payment_tools(setup: &Doc, params: &Doc, _ctx: &CheckCtx) -> CheckResult {
+fn no_payment_tools(setup: &Doc, params: &Doc, _ctx: &CheckCtx) -> Result<CheckResult, Crash> {
     let mut words: Vec<String> = PAYMENT_WORDS.iter().map(|w| w.to_string()).collect();
     words.extend(
-        param_list(params, "patterns")
+        param_list(params, "patterns")?
             .into_iter()
             .map(|w| js(Some(w)).to_lowercase()),
     );
-    let allowed = param_list(params, "allow");
+    let allowed = param_list(params, "allow")?;
     // The first word that names a payment surface: a hyphenated word anywhere in the name,
     // any other word as a whole token. As in the reference, a first match that is the empty
     // word (an empty extra pattern) counts as no match.
@@ -345,6 +419,7 @@ fn no_payment_tools(setup: &Doc, params: &Doc, _ctx: &CheckCtx) -> CheckResult {
     };
     let denied_servers = arr(get_path(setup, "tools.denied_mcp_servers"));
     let deny = str_list(get_path(setup, "tools.permissions.deny"));
+    let deny_globs: Vec<Glob> = deny.iter().map(|e| Glob::new(e)).collect();
     let (mut found, mut dormant) = (Vec::new(), Vec::new());
     // `state` is None for a live surface, or the reason it is dormant.
     let mut consider = |kind: &str, id: Option<&Doc>, name: &str, state: Option<String>| {
@@ -398,7 +473,7 @@ fn no_payment_tools(setup: &Doc, params: &Doc, _ctx: &CheckCtx) -> CheckResult {
     for a in str_list(get_path(setup, "tools.permissions.allow")) {
         // mcp__<server>__<tool>: only live if that server is currently defined and enabled.
         let server = mcp_server_re().captures(&a).map(|c| c[1].to_string());
-        let state = if covered(&a, &deny) {
+        let state = if covered(&a, &deny_globs) {
             Some("denied")
         } else if server.is_some_and(|v| {
             !live_servers.contains(&v) && !live_servers.contains(&v.replace('_', "-"))
@@ -432,7 +507,7 @@ fn no_payment_tools(setup: &Doc, params: &Doc, _ctx: &CheckCtx) -> CheckResult {
             .into_iter()
             .chain(dormant.into_iter().map(|d| format!("dormant: {d}")))
             .collect();
-        return CheckResult::fail(msg, evidence);
+        return Ok(CheckResult::fail(msg, evidence));
     }
     if !dormant.is_empty() {
         let msg = format!(
@@ -440,19 +515,19 @@ fn no_payment_tools(setup: &Doc, params: &Doc, _ctx: &CheckCtx) -> CheckResult {
             dormant.len(),
             entries(dormant.len())
         );
-        return CheckResult::warn(msg, dormant);
+        return Ok(CheckResult::warn(msg, dormant));
     }
-    CheckResult::pass("no payment-capable tools", Vec::new())
+    Ok(CheckResult::pass("no payment-capable tools", Vec::new()))
 }
 
-fn forbidden_paths(setup: &Doc, params: &Doc, ctx: &CheckCtx) -> CheckResult {
+fn forbidden_paths(setup: &Doc, params: &Doc, ctx: &CheckCtx) -> Result<CheckResult, Crash> {
     let home = ctx.home.as_path();
     let norm = |p: &str| {
         tilde(&expand_home(p, home), home)
             .trim_end_matches('/')
             .to_string()
     };
-    let forbidden: Vec<String> = param_list(params, "paths")
+    let forbidden: Vec<String> = param_list(params, "paths")?
         .into_iter()
         .map(|p| norm(&js(Some(p))))
         .collect();
@@ -496,14 +571,14 @@ fn forbidden_paths(setup: &Doc, params: &Doc, ctx: &CheckCtx) -> CheckResult {
     }
     if bad.is_empty() {
         let msg = format!("{} forbidden path(s) unreferenced", forbidden.len());
-        CheckResult::pass(msg, Vec::new())
+        Ok(CheckResult::pass(msg, Vec::new()))
     } else {
         let msg = format!("{} reference(s) to forbidden paths", bad.len());
-        CheckResult::fail(msg, bad)
+        Ok(CheckResult::fail(msg, bad))
     }
 }
 
-fn required_gate(setup: &Doc, params: &Doc, _ctx: &CheckCtx) -> CheckResult {
+fn required_gate(setup: &Doc, params: &Doc, _ctx: &CheckCtx) -> Result<CheckResult, Crash> {
     let gate = params.get("gate");
     let gate_name = js(gate);
     let Some(g) = arr(get_path(setup, "brain.gates"))
@@ -511,8 +586,10 @@ fn required_gate(setup: &Doc, params: &Doc, _ctx: &CheckCtx) -> CheckResult {
         .find(|x| x.get("id") == gate)
     else {
         let msg = format!("gate \"{gate_name}\" is not defined in brain.gates");
-        return CheckResult::fail(msg, Vec::new());
+        return Ok(CheckResult::fail(msg, Vec::new()));
     };
+    // Read after the gate lookup, as the reference did, so a missing gate is reported first.
+    let kinds = param_list(params, "channel_kinds")?;
     let applies: HashSet<String> = arr(g.get("applies_to"))
         .iter()
         .map(|x| js(Some(x)).to_lowercase())
@@ -523,7 +600,7 @@ fn required_gate(setup: &Doc, params: &Doc, _ctx: &CheckCtx) -> CheckResult {
     };
     let mut missing = Vec::new();
     let mut n = 0;
-    for kind in param_list(params, "channel_kinds") {
+    for kind in kinds {
         let key = js(Some(kind));
         for c in arr(setup.get("channels").and_then(|ch| ch.get(key.as_str()))) {
             if !is_active_channel(c) {
@@ -546,19 +623,19 @@ fn required_gate(setup: &Doc, params: &Doc, _ctx: &CheckCtx) -> CheckResult {
     }
     if missing.is_empty() {
         let msg = format!("gate {gate_name} covers {n} active channel(s)");
-        CheckResult::pass(msg, Vec::new())
+        Ok(CheckResult::pass(msg, Vec::new()))
     } else {
         let msg = format!(
             "{} active channel(s) bypass gate {gate_name}",
             missing.len()
         );
-        CheckResult::fail(msg, missing)
+        Ok(CheckResult::fail(msg, missing))
     }
 }
 
-fn channel_identity(setup: &Doc, params: &Doc, _ctx: &CheckCtx) -> CheckResult {
+fn channel_identity(setup: &Doc, params: &Doc, _ctx: &CheckCtx) -> Result<CheckResult, Crash> {
     let kind = js(params.get("kind"));
-    let allowed = param_list(params, "allowed");
+    let allowed = param_list(params, "allowed")?;
     let accounts = arr(get_path(setup, "identity.accounts"));
     let (mut bad, mut warns) = (Vec::new(), Vec::new());
     for c in arr(setup.get("channels").and_then(|ch| ch.get(kind.as_str()))) {
@@ -594,18 +671,18 @@ fn channel_identity(setup: &Doc, params: &Doc, _ctx: &CheckCtx) -> CheckResult {
     }
     if !bad.is_empty() {
         let msg = format!("{} {kind} channel(s) use a disallowed identity", bad.len());
-        return CheckResult::fail(msg, [bad, warns].concat());
+        return Ok(CheckResult::fail(msg, [bad, warns].concat()));
     }
     if warns.is_empty() {
         let msg = format!("all {kind} channels post through allowed identities");
-        CheckResult::pass(msg, Vec::new())
+        Ok(CheckResult::pass(msg, Vec::new()))
     } else {
         let msg = format!("{kind} identities ok, {} note(s)", warns.len());
-        CheckResult::warn(msg, warns)
+        Ok(CheckResult::warn(msg, warns))
     }
 }
 
-fn secrets_by_reference(setup: &Doc, _params: &Doc, _ctx: &CheckCtx) -> CheckResult {
+fn secrets_by_reference(setup: &Doc, _params: &Doc, _ctx: &CheckCtx) -> Result<CheckResult, Crash> {
     fn walk(v: &Doc, path: &str, hits: &mut Vec<String>) {
         match v {
             Value::String(text) => {
@@ -636,14 +713,17 @@ fn secrets_by_reference(setup: &Doc, _params: &Doc, _ctx: &CheckCtx) -> CheckRes
     let mut hits = Vec::new();
     walk(setup, "", &mut hits);
     if hits.is_empty() {
-        CheckResult::pass("no secret values; references only", Vec::new())
+        Ok(CheckResult::pass(
+            "no secret values; references only",
+            Vec::new(),
+        ))
     } else {
         let msg = format!("{} secret-looking value(s) in setup", hits.len());
-        CheckResult::fail(msg, hits)
+        Ok(CheckResult::fail(msg, hits))
     }
 }
 
-fn loop_success_metric(setup: &Doc, params: &Doc, _ctx: &CheckCtx) -> CheckResult {
+fn loop_success_metric(setup: &Doc, params: &Doc, _ctx: &CheckCtx) -> Result<CheckResult, Crash> {
     // Defaults to true only when absent; an explicit null counts as false.
     let only_managed = match params.get("only_managed") {
         None => true,
@@ -659,16 +739,19 @@ fn loop_success_metric(setup: &Doc, params: &Doc, _ctx: &CheckCtx) -> CheckResul
         .map(|l| js(l.get("id")))
         .collect();
     if missing.is_empty() {
-        CheckResult::pass("every enabled loop has a success metric", Vec::new())
+        Ok(CheckResult::pass(
+            "every enabled loop has a success metric",
+            Vec::new(),
+        ))
     } else {
         let msg = format!("{} enabled loop(s) without a success metric", missing.len());
-        CheckResult::fail(msg, missing)
+        Ok(CheckResult::fail(msg, missing))
     }
 }
 
-fn required_rules(setup: &Doc, params: &Doc, _ctx: &CheckCtx) -> CheckResult {
+fn required_rules(setup: &Doc, params: &Doc, _ctx: &CheckCtx) -> Result<CheckResult, Crash> {
     let rules = arr(get_path(setup, "instructions.rules"));
-    let ids = param_list(params, "ids");
+    let ids = param_list(params, "ids")?;
     let mut bad = Vec::new();
     for &id in &ids {
         let name = js(Some(id));
@@ -687,21 +770,25 @@ fn required_rules(setup: &Doc, params: &Doc, _ctx: &CheckCtx) -> CheckResult {
     }
     if bad.is_empty() {
         let msg = format!("{} required hard rule(s) in force", ids.len());
-        CheckResult::pass(msg, Vec::new())
+        Ok(CheckResult::pass(msg, Vec::new()))
     } else {
         let msg = format!("{} required rule(s) not in force", bad.len());
-        CheckResult::fail(msg, bad)
+        Ok(CheckResult::fail(msg, bad))
     }
 }
 
-fn forbidden_accounts_unused(setup: &Doc, _params: &Doc, _ctx: &CheckCtx) -> CheckResult {
+fn forbidden_accounts_unused(
+    setup: &Doc,
+    _params: &Doc,
+    _ctx: &CheckCtx,
+) -> Result<CheckResult, Crash> {
     let forbidden: Vec<Option<&Doc>> = arr(get_path(setup, "identity.accounts"))
         .iter()
         .filter(|a| is_str(a.get("access"), "forbidden"))
         .map(|a| a.get("id"))
         .collect();
     if forbidden.is_empty() {
-        return CheckResult::skip("no forbidden accounts declared");
+        return Ok(CheckResult::skip("no forbidden accounts declared"));
     }
     let mut refs = Vec::new();
     if let Some(Value::Object(channels)) = setup.get("channels") {
@@ -720,10 +807,10 @@ fn forbidden_accounts_unused(setup: &Doc, _params: &Doc, _ctx: &CheckCtx) -> Che
     }
     if refs.is_empty() {
         let msg = format!("{} forbidden account(s) unreferenced", forbidden.len());
-        CheckResult::pass(msg, Vec::new())
+        Ok(CheckResult::pass(msg, Vec::new()))
     } else {
         let msg = format!("{} reference(s) to forbidden accounts", refs.len());
-        CheckResult::fail(msg, refs)
+        Ok(CheckResult::fail(msg, refs))
     }
 }
 
@@ -1712,6 +1799,171 @@ mod tests {
             Status::Fail,
             "1 active channel(s) bypass gate gate",
             &["social/x"],
+        );
+    }
+
+    // ---- a list param set to null fails closed, as the reference's crash did
+
+    fn assert_null_crash(r: &CheckResult, param: &str) {
+        assert_eq!(r.status, Status::Fail, "{r:?}");
+        assert!(r.message.starts_with("check crashed:"), "{}", r.message);
+        assert_eq!(r.message, format!("check crashed: {param} is null"));
+        assert!(r.evidence.is_empty());
+    }
+
+    #[test]
+    fn required_gate_fails_closed_on_null_channel_kinds() {
+        let p = json!({ "gate": "gate", "channel_kinds": null });
+        let r = check("required_gate", &base(), p, &ctx());
+        assert_null_crash(&r, "channel_kinds");
+        // As in the reference, a missing gate is reported before the kinds are read.
+        let p = json!({ "gate": "nope", "channel_kinds": null });
+        let r = check("required_gate", &base(), p, &ctx());
+        assert_eq!(r.message, "gate \"nope\" is not defined in brain.gates");
+    }
+
+    #[test]
+    fn forbidden_paths_fails_closed_on_null_paths() {
+        let r = check("forbidden_paths", &base(), json!({ "paths": null }), &ctx());
+        assert_null_crash(&r, "paths");
+    }
+
+    #[test]
+    fn required_rules_fails_closed_on_null_ids() {
+        let r = check("required_rules", &base(), json!({ "ids": null }), &ctx());
+        assert_null_crash(&r, "ids");
+    }
+
+    #[test]
+    fn every_list_param_fails_closed_when_null() {
+        for (id, param) in [
+            ("deny_mcp", "servers"),
+            ("deny_mcp", "tool_patterns"),
+            ("no_payment_tools", "patterns"),
+            ("no_payment_tools", "allow"),
+            ("forbidden_paths", "paths"),
+            ("required_gate", "channel_kinds"),
+            ("channel_identity", "allowed"),
+            ("required_rules", "ids"),
+        ] {
+            let mut p = json!({ "gate": "gate", "kind": "slack" });
+            p[param] = Value::Null;
+            assert_null_crash(&check(id, &base(), p, &ctx()), param);
+        }
+        // Absent list params still default to empty lists.
+        let r = check("deny_mcp", &base(), json!({}), &ctx());
+        assert_eq!(r.status, Status::Pass);
+    }
+
+    // ---- glob matching
+
+    #[test]
+    fn glob_matches_exactly_like_glob_to_regex() {
+        let globs = [
+            "",
+            "*",
+            "**",
+            "a*",
+            "*a",
+            "a*b",
+            "a**b",
+            "a*b*c",
+            "mcp__work__*",
+            "MCP__*",
+            "*__send",
+            "Bash(*)",
+            "x.y",
+            "a?b",
+            "[ab]+",
+            "é*",
+            "*ß",
+            "k*",
+            "*\n*",
+        ];
+        let texts = [
+            "",
+            "a",
+            "ab",
+            "aXb",
+            "abc",
+            "a-b-c",
+            "acb",
+            "aab",
+            "mcp__Work__Send",
+            "MCP__WORK__X",
+            "mcp__work__",
+            "Bash(ls -la)",
+            "bash(x)",
+            "x.y",
+            "xzy",
+            "a?b",
+            "[ab]+",
+            "é",
+            "É",
+            "éa",
+            "ß",
+            "SS",
+            "xß",
+            "\u{212A}",
+            "k",
+            "K",
+            "a\nb",
+            "ab\n",
+            "\n",
+            "x__send",
+            "x__SEND\n",
+        ];
+        for g in globs {
+            let glob = Glob::new(g);
+            for t in texts {
+                assert_eq!(
+                    glob.is_match(t),
+                    glob_to_regex(g).is_match(t),
+                    "glob {g:?} on {t:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn long_permission_lists_stay_fast() {
+        // 300 allow entries against 50 deny globs: both checks once, in a debug build.
+        let mut s = base();
+        let allow: Vec<String> = (0..300)
+            .map(|i| match i % 3 {
+                0 => format!("mcp__server{}__tool{i}", i % 20),
+                1 => format!("Bash(tool{i} run:*)"),
+                _ => format!("WebFetch(domain:site{i}.example.com)"),
+            })
+            .collect();
+        let deny: Vec<String> = (0..50)
+            .map(|i| {
+                if i % 2 == 0 {
+                    format!("mcp__blocked{i}__*")
+                } else {
+                    format!("Bash(danger{i}:*)")
+                }
+            })
+            .collect();
+        let servers: Vec<Value> = (0..20)
+            .map(|i| json!({ "id": format!("server{i}"), "enabled": true }))
+            .collect();
+        s["tools"]["permissions"]["allow"] = json!(allow);
+        s["tools"]["permissions"]["deny"] = json!(deny);
+        s["tools"]["mcp_servers"] = Value::Array(servers);
+        let p = json!({
+            "servers": ["blocked0", "blocked2"],
+            "tool_patterns": ["mcp__blocked0__*", "mcp__blocked2__*", "mcp__server1__*"]
+        });
+        let start = std::time::Instant::now();
+        let deny_result = check("deny_mcp", &s, p, &ctx());
+        let pay_result = check("no_payment_tools", &s, json!({}), &ctx());
+        let took = start.elapsed();
+        assert_eq!(deny_result.status, Status::Fail);
+        assert_eq!(pay_result.status, Status::Pass);
+        assert!(
+            took < std::time::Duration::from_millis(100),
+            "both checks took {took:?}"
         );
     }
 }
