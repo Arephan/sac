@@ -3,3 +3,6 @@ out/
 # Instance data is personal. Each person keeps their own instance/<name>/ out of the shared framework.
 instance/*
 !instance/README.md
+target/
+.superpowers/
+.worktrees/
