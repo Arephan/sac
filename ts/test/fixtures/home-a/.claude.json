@@ -1,0 +1,43 @@
+{
+  "numStartups": 5,
+  "oauthAccount": {
+    "emailAddress": "someone@example.invalid"
+  },
+  "mcpServers": {
+    "github": {
+      "type": "stdio",
+      "command": "__HOME__/bin/github-mcp",
+      "args": [
+        "stdio"
+      ],
+      "env": {
+        "GITHUB_PERSONAL_ACCESS_TOKEN": "__GH_MCP__"
+      }
+    },
+    "linear": {
+      "type": "http",
+      "url": "https://mcp.linear.app/mcp",
+      "headers": {
+        "Authorization": "__LINEAR__"
+      }
+    },
+    "slackbot": {
+      "type": "stdio",
+      "command": "npx",
+      "args": [
+        "slack-mcp",
+        "--token",
+        "__SLACK_MCP__"
+      ]
+    }
+  },
+  "projects": {
+    "/x": {
+      "mcpServers": {
+        "project-only": {
+          "command": "x"
+        }
+      }
+    }
+  }
+}

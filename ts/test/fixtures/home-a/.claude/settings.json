@@ -1,0 +1,36 @@
+{
+  "model": "opus",
+  "env": {
+    "GITHUB_TOKEN": "__GH_TOKEN__",
+    "LOG_LEVEL": "info",
+    "DEPLOY_HOOK": "__SLACK_BOT__"
+  },
+  "permissions": {
+    "allow": [
+      "Bash(ls:*)"
+    ],
+    "deny": [
+      "Bash(rm -rf:*)"
+    ]
+  },
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/format.sh --quiet"
+          }
+        ]
+      }
+    ]
+  },
+  "statusLine": {
+    "type": "command",
+    "command": "__HOME__/.claude/statusline.sh"
+  },
+  "enabledPlugins": {
+    "superpowers@claude-plugins-official": true
+  }
+}

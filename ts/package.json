@@ -1,0 +1,39 @@
+{
+  "name": "setup-as-code",
+  "version": "1.0.0-dev",
+  "description": "Save your Claude Code setup as a git repo and bring it back anywhere",
+  "type": "module",
+  "bin": {
+    "sac": "dist/cli.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "vitest run",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "@inquirer/prompts": "^8.7.3",
+    "@secretlint/core": "^13.0.7",
+    "@secretlint/secretlint-rule-preset-recommend": "^13.0.7",
+    "commander": "^15.0.0",
+    "deepmerge": "^4.3.1",
+    "diff": "^9.0.0",
+    "dotenv": "^18.0.8",
+    "execa": "^10.1.1",
+    "fast-glob": "^3.3.3",
+    "plist": "^5.0.0",
+    "yaml": "^2.9.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.5",
+    "typescript": "^7.0.2",
+    "vitest": "^5.0.5"
+  }
+}

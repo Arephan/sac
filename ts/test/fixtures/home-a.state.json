@@ -1,0 +1,66 @@
+{
+  "version": "2.1.301 (Claude Code)",
+  "marketplaces": [
+    {
+      "name": "claude-plugins-official",
+      "source": "github",
+      "repo": "anthropics/claude-plugins-official"
+    },
+    {
+      "name": "acme",
+      "source": "git",
+      "url": "https://git.example.invalid/acme/plugins.git"
+    },
+    {
+      "name": "local",
+      "source": "directory",
+      "path": "__HOME__/my-plugins"
+    }
+  ],
+  "plugins": [
+    {
+      "id": "superpowers@claude-plugins-official",
+      "scope": "user",
+      "enabled": true
+    },
+    {
+      "id": "posthog@claude-plugins-official",
+      "scope": "user",
+      "enabled": false
+    },
+    {
+      "id": "deploy@acme",
+      "scope": "user",
+      "enabled": true
+    },
+    {
+      "id": "projonly@acme",
+      "scope": "project",
+      "enabled": true
+    },
+    {
+      "id": "synced@synced",
+      "scope": "synced",
+      "enabled": true
+    }
+  ],
+  "configure": {
+    "deploy@acme": {
+      "pluginId": "deploy@acme",
+      "schema": {
+        "region": {
+          "type": "string"
+        },
+        "apiKey": {
+          "type": "string",
+          "sensitive": true
+        }
+      },
+      "inputs": {
+        "region": "eu-west-1",
+        "apiKey": "__DEPLOY_KEY__"
+      }
+    }
+  },
+  "mcpStatus": {}
+}

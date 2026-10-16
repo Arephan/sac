@@ -1,0 +1,4 @@
+---
+name: terse
+---
+Short.
