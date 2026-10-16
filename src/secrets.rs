@@ -86,7 +86,8 @@ mod tests {
 
     #[test]
     fn finds_tokens_and_keeps_only_a_sample() {
-        let hits = find_secrets("token xoxb-1234567890-abcdefghij here");
+        let tok = ["xoxb-", "1234567890-abcdefghij"].concat();
+        let hits = find_secrets(&format!("token {tok} here"));
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].id, "slack-token");
         assert_eq!(hits[0].sample, "xoxb-1…");

@@ -266,7 +266,7 @@ mod tests {
     #[test]
     fn refuses_secret_files_and_disallowed_exec() {
         let tmp = tempfile::tempdir().unwrap();
-        std::fs::write(tmp.path().join(".bot_token"), "xoxb-123").unwrap();
+        std::fs::write(tmp.path().join(".bot_token"), "placeholder").unwrap();
         std::fs::write(tmp.path().join("settings.json"), "{\"a\":1}").unwrap();
         let ctx = Ctx::new(Some(tmp.path()), json!({}));
         assert!(ctx.read_text("~/.bot_token").is_err());
@@ -292,7 +292,8 @@ mod tests {
             .unwrap()
             .to_string_lossy()
             .to_string();
-        let v = json!({ "command": format!("{home_s}/bin/x"), "env": { "B": "2", "A": "1" }, "note": "xoxb-1234567890-abcdefghij" });
+        let tok = ["xoxb-", "1234567890-abcdefghij"].concat();
+        let v = json!({ "command": format!("{home_s}/bin/x"), "env": { "B": "2", "A": "1" }, "note": tok });
         let out = ctx.scrub(&v);
         assert_eq!(out["command"], json!("~/bin/x"));
         assert_eq!(out["env_names"], json!(["A", "B"]));

@@ -1,0 +1,24 @@
+#!/usr/bin/env python3
+"""External check: at most params.max loops are enabled at once.
+
+Protocol:
+  max-enabled-loops describe -> {"id","doc"}
+  max-enabled-loops run      -> reads {"setup","params","ctx"} on stdin, prints {"status","message","evidence"}
+Checks are pure: read the setup, never the machine.
+"""
+import json, sys
+
+cmd = sys.argv[1] if len(sys.argv) > 1 else ""
+if cmd == "describe":
+    print(json.dumps({"id": "max_enabled_loops", "doc": "At most params.max loops are enabled at once (keeps token spend predictable)."}))
+elif cmd == "run":
+    req = json.load(sys.stdin)
+    setup, params = req.get("setup") or {}, req.get("params") or {}
+    mx = int(params.get("max", 10))
+    on = [l.get("id") for l in (setup.get("loops") or []) if l.get("enabled")]
+    if len(on) > mx:
+        print(json.dumps({"status": "fail", "message": f"{len(on)} enabled loops > {mx}", "evidence": on}))
+    else:
+        print(json.dumps({"status": "pass", "message": f"{len(on)} enabled loop(s) <= {mx}", "evidence": []}))
+else:
+    sys.exit(2)

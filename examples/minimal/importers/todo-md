@@ -1,0 +1,30 @@
+#!/usr/bin/env python3
+"""External importer: a markdown todo file (- [ ] / - [x]) as channels.todo with counts.
+
+Protocol (any language works):
+  todo-md describe  -> {"id","layers","description"} on stdout
+  todo-md detect    -> exit 0 when this importer applies (env SAC_HOME, SAC_REAL_HOME)
+  todo-md run       -> reads import.options["todo-md"] as JSON on stdin, prints a setup fragment
+"""
+import json, os, re, sys
+
+HOME = os.environ.get("SAC_HOME", os.path.expanduser("~"))
+PATH = os.path.join(HOME, "assistant", "todo.md")
+
+cmd = sys.argv[1] if len(sys.argv) > 1 else ""
+if cmd == "describe":
+    print(json.dumps({"id": "todo-md", "layers": ["channels"],
+                      "description": "Markdown todo file (- [ ] / - [x]) as channels.todo with counts."}))
+elif cmd == "detect":
+    sys.exit(0 if os.path.exists(PATH) else 1)
+elif cmd == "run":
+    try:
+        json.load(sys.stdin)
+    except Exception:
+        pass
+    text = open(PATH, encoding="utf-8").read()
+    open_n = len(re.findall(r"^\s*- \[ \]", text, re.M))
+    done_n = len(re.findall(r"^\s*- \[x\]", text, re.M | re.I))
+    print(json.dumps({"channels": {"todo": [{"id": "todo", "path": "~/assistant/todo.md", "open": open_n, "done": done_n}]}}))
+else:
+    sys.exit(2)

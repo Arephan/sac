@@ -82,25 +82,28 @@ safety:
 
 ## Custom checks
 
-Put a `.mjs` file in `<instance>/checks/`:
+Put an executable in `<instance>/checks/`. Any language works.
 
-```js
-// <instance>/checks/max-enabled-loops.mjs
-export default {
-  id: 'max_enabled_loops',
-  doc: 'At most params.max loops are enabled at once.',
-  run(setup, { max = 10 } = {}, ctx) {       // ctx: { home, outRoot }
-    const on = (setup.loops || []).filter((l) => l.enabled).map((l) => l.id);
-    return on.length > max
-      ? { status: 'fail', message: `${on.length} enabled loops > ${max}`, evidence: on }
-      : { status: 'pass', message: `${on.length} enabled`, evidence: [] };
-  },
-};
+| invocation | stdin | stdout |
+|---|---|---|
+| `<exe> describe` | | `{"id":"max_enabled_loops","doc":"..."}` |
+| `<exe> run` | `{"setup":{...},"params":{...},"ctx":{"home":"...","out_root":"..."}}` | `{"status":"pass|fail|warn|skip","message":"...","evidence":["..."]}` |
+
+```python
+#!/usr/bin/env python3
+import json, sys
+cmd = sys.argv[1]
+if cmd == "describe":
+    print(json.dumps({"id": "max_enabled_loops", "doc": "At most params.max loops are enabled at once."}))
+elif cmd == "run":
+    req = json.load(sys.stdin)
+    mx = int((req.get("params") or {}).get("max", 10))
+    on = [l["id"] for l in (req["setup"].get("loops") or []) if l.get("enabled")]
+    status = "fail" if len(on) > mx else "pass"
+    print(json.dumps({"status": status, "message": f"{len(on)} enabled loop(s), max {mx}", "evidence": on if status == "fail" else []}))
 ```
 
 Then reference it: `{ id: few-loops, check: max_enabled_loops, severity: standing, params: { max: 5 } }`.
-A check returns `status` = `pass | fail | warn | skip`, a one-line `message`, and `evidence` (strings).
-Keep checks pure: they get the whole setup object and must not touch the machine.
-
-Add a fixture pair for each new check to `framework/selftest.mjs` (one setup that must fail, one
-that must pass) so the check is proven to catch what it claims to.
+A crash, a timeout or malformed output counts as a failed check with a `check crashed:` message.
+Keep checks pure: they get the whole setup object and must not touch the machine. A working copy
+lives in `examples/minimal/checks/max-enabled-loops`.

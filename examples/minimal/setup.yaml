@@ -1,6 +1,6 @@
 # Minimal example: one person, one chat bot, one email gate, one scheduled loop, four policies.
-# Try it:  node setup.mjs validate -i examples/minimal
-#          node setup.mjs verify   -i examples/minimal --home /tmp/empty-home
+# Try it:  sac validate -i examples/minimal
+#          sac verify   -i examples/minimal --home /tmp/empty-home
 version: 1
 meta:
   instance: minimal
@@ -132,6 +132,6 @@ safety:
       check: loop_success_metric
       severity: standing
     - id: few-loops
-      check: max_enabled_loops      # custom check from checks/max-enabled-loops.mjs
+      check: max_enabled_loops      # custom check: checks/max-enabled-loops (an executable)
       severity: standing
       params: { max: 5 }

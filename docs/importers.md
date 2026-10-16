@@ -14,9 +14,9 @@ An importer discovers one part of a setup from the machine and returns a fragmen
 | `claude-skills` | tools | `~/.claude/skills/*/SKILL.md` frontmatter, `~/.claude/commands/*.md` |
 | `claude-instructions` | instructions | each `## ` section of `~/.claude/CLAUDE.md` becomes a rule; `@imports` become sources |
 | `claude-memory` | instructions, projects, data, identity | auto-memory files: `feedback` = rules, `project` = projects, `reference` = references, `user` = profile refs (path only) |
-| `launchd` | loops | `~/Library/LaunchAgents` (+ `disabled/`, parked `*.plist.*` copies), `launchctl list`, `launchctl print-disabled` |
+| `launchd` | loops | `~/Library/LaunchAgents` (+ `disabled/`, parked `*.plist.*` copies) parsed in-process, `launchctl list`, `launchctl print-disabled` |
 | `cron` | loops | `crontab -l` |
-| `infra` | infra | OS version, which CLIs exist, git repos under `~` |
+| `infra` | infra | OS version, which CLIs exist on `PATH`, git repos under the configured roots (origin URL from `.git/config`) |
 | `file-state` | data | existence (only) of each `data.state[].path` you declared |
 
 Options go under `import.options.<importer id>` (in `setup.yaml` or `overrides.yaml`):
@@ -46,40 +46,40 @@ loops:
 
 ## Writing a custom importer
 
-Put a `.mjs` file in `<instance>/importers/`. It is loaded automatically; an id equal to a
-built-in replaces the built-in. Add the id to `import.importers` if you list importers explicitly.
+Put an executable in `<instance>/importers/`. Any language works. It is loaded automatically; an
+id equal to a built-in replaces the built-in. Add the id to `import.importers` if you list
+importers explicitly.
 
-```js
-// <instance>/importers/todo-md.mjs
-export default {
-  id: 'todo-md',                       // kebab-case, unique
-  layers: ['channels'],                // which layers the fragment touches
-  description: 'Markdown todo file as channels.todo with counts.',
-  detect: (ctx) => ctx.exists('~/assistant/todo.md'),   // optional; false = skipped
-  run(ctx, options) {                  // options = import.options['todo-md']
-    const text = ctx.readText('~/assistant/todo.md');
-    const open = (text.match(/^\s*- \[ \]/gm) || []).length;
-    return { channels: { todo: [{ id: 'todo', path: '~/assistant/todo.md', open }] } };
-  },
-};
+The protocol has three subcommands:
+
+| invocation | stdin | stdout | meaning |
+|---|---|---|---|
+| `<exe> describe` | | `{"id":"todo-md","layers":["channels"],"description":"..."}` | identity, read once at load |
+| `<exe> detect` | | | exit 0 = applies to this machine, anything else = skipped |
+| `<exe> run` | `import.options["todo-md"]` as JSON | a fragment of `setup.yaml` as JSON | the import |
+
+Environment for `detect` and `run`: `SAC_HOME` (the home being read; a sandbox under `--home`)
+and `SAC_REAL_HOME` (`1` when it is the real home, `0` otherwise). Machine-wide probes should
+run only when `SAC_REAL_HOME` is `1`.
+
+```python
+#!/usr/bin/env python3
+import json, os, re, sys
+HOME = os.environ.get("SAC_HOME", os.path.expanduser("~"))
+PATH = os.path.join(HOME, "assistant", "todo.md")
+cmd = sys.argv[1]
+if cmd == "describe":
+    print(json.dumps({"id": "todo-md", "layers": ["channels"], "description": "Markdown todo file as channels.todo"}))
+elif cmd == "detect":
+    sys.exit(0 if os.path.exists(PATH) else 1)
+elif cmd == "run":
+    text = open(PATH).read()
+    open_n = len(re.findall(r"^\s*- \[ \]", text, re.M))
+    print(json.dumps({"channels": {"todo": [{"id": "todo", "path": "~/assistant/todo.md", "open": open_n}]}}))
 ```
 
-A working copy lives in `examples/minimal/importers/todo-md.mjs`. Check it is picked up with
-`node setup.mjs importers -i <instance>`.
-
-### The `ctx` object
-
-Importers must use `ctx` for all machine access. It is what keeps import read-only.
-
-| member | does |
-|---|---|
-| `ctx.home`, `ctx.isRealHome` | the home being read (`--home` overrides); machine-wide probes should run only when `isRealHome` |
-| `ctx.p(path)`, `ctx.tilde(abs)` | expand `~`; turn an absolute path back into `~/...` |
-| `ctx.exists`, `ctx.isDir`, `ctx.list`, `ctx.stat` | filesystem metadata |
-| `ctx.readText`, `ctx.readJSON`, `ctx.tryJSON` | read a file; **throws** on secret-looking names (`*token*`, `*_key`, `.env`, `auth.json`, keys, cookies) |
-| `ctx.exec(cmd, args)`, `ctx.tryExec` | run an allowlisted read-only command; anything else throws |
-| `ctx.scrub(value)` | replace `~`, turn `env`/`headers`/`token`/... keys into `<key>_names: [...]`, drop secret-shaped strings |
-| `ctx.warn(msg)` | record a warning shown by `import -v` |
+A working copy lives in `examples/minimal/importers/todo-md`. Check it is picked up with
+`sac importers -i <instance>`.
 
 Rules for importers:
 
@@ -88,4 +88,5 @@ Rules for importers:
 3. Return `[]` for a collection you looked at and found empty (that marks it observed), and
    leave it out entirely if you did not look.
 4. Give items stable ids so `plan` can diff them across runs.
-5. Keep personal specifics out of the importer: take them from `options`.
+5. Keep personal specifics out of the importer: take them from the options on stdin.
+6. Use `~/...` paths in the fragment, never the absolute home.

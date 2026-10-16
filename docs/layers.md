@@ -1,8 +1,8 @@
 # Layers
 
 `setup.yaml` has eleven layers. Each is a top-level key. Lists of items are keyed by `id`;
-`plan` diffs them item by item. The schema is `framework/schema/setup.schema.json`; layer
-definitions (which collections exist, which get diffed) are in `framework/layers/index.mjs`.
+`plan` diffs them item by item. The schema is `schema/setup.schema.json`; layer
+definitions (which collections exist, which get diffed) are in `src/layers.rs`.
 
 Conventions for every layer:
 
