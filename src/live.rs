@@ -9,8 +9,8 @@
 //!   holds env names, not values, so the names that still need a value go in the report.
 //! - `~/.claude.json`: user-scope `mcpServers` the file lacks are added (the file is created as
 //!   `{"mcpServers":{}}` when absent). An existing server keeps its `env` and `headers` always,
-//!   and its `command`, `args`, `url`, `type` unless `force`. Disabled and denied servers are
-//!   never added. Project-scoped servers stay out of the user scope.
+//!   and its `command`, `args`, `url`, `type` unless `force`. Disabled and denied servers and
+//!   `name@source` duplicates are never added. Project-scoped servers stay out of the user scope.
 //! - launchd plists: `~/Library/LaunchAgents/<label>.plist`, disabled loops under `disabled/`,
 //!   written when missing or with `force`. `launchctl` is never run.
 //! - `~/.claude/setup-as-code/{RULES.md,setup.lock.json,report.md}`: regenerated every run.
@@ -1061,6 +1061,34 @@ mod tests {
         assert!(servers.get("files").is_some());
         assert!(r.skipped.iter().any(|s| s.contains("mcpServers.proj")));
         assert!(r.skipped.iter().any(|s| s.contains("mcpServers.linked")));
+    }
+
+    #[test]
+    fn live_never_lets_an_at_suffixed_duplicate_touch_its_namesake() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        let d = json!({
+            "version": 1,
+            "meta": { "instance": "alex" },
+            "tools": { "mcp_servers": [
+                { "id": "notes", "transport": "http", "url": "https://mcp.example.com/notes", "header_names": ["Authorization"] },
+                { "id": "notes@~/.claude/mcp.json", "source": "~/.claude/mcp.json", "transport": "stdio", "command": "notes-local" }
+            ]}
+        });
+        for force in [false, true] {
+            let r = apply_live(&d, &opts(home, true, force)).unwrap();
+            let servers = read_json(&home.join(".claude.json"))["mcpServers"].clone();
+            assert_eq!(servers, mcp_servers_doc(&d)["mcpServers"], "force={force}");
+            assert_eq!(
+                servers["notes"]["headers"]["Authorization"],
+                json!("${AUTHORIZATION}")
+            );
+            assert!(
+                !r.skipped.iter().any(|s| s.contains("differs")),
+                "{:?}",
+                r.skipped
+            );
+        }
     }
 
     #[cfg(unix)]

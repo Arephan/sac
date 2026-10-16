@@ -431,10 +431,18 @@ pub fn claude_settings_doc(desired: &Doc) -> Doc {
     Value::Object(out)
 }
 
-/// `enabled: false` servers and servers named in `tools.denied_mcp_servers` are never rendered.
+/// Never rendered or installed: `enabled: false` servers, servers named in
+/// `tools.denied_mcp_servers`, and `name@source` ids. The MCP importer gives a second
+/// definition of an existing name (a project-scoped or other-file duplicate) such an id, and
+/// rendering it under `name` would overwrite the user-scope server of that name. (The reference
+/// rendered them and let the last definition win.)
 pub(crate) fn mcp_excluded(server: &Doc, denied: &[Doc]) -> bool {
     server.get("enabled") == Some(&Value::Bool(false))
         || server.get("id").is_some_and(|id| denied.contains(id))
+        || server
+            .get("id")
+            .and_then(|id| id.as_str())
+            .is_some_and(|id| id.contains('@'))
 }
 
 /// One `mcpServers` entry: the name (the id up to its first `@`) and the definition, with env
@@ -476,7 +484,7 @@ pub(crate) fn mcp_entry(server: &Doc) -> (String, Doc) {
     (key, Value::Object(def))
 }
 
-/// `{ "mcpServers": { name: definition } }` for every server that is neither disabled nor denied.
+/// `{ "mcpServers": { name: definition } }` for every server `mcp_excluded` lets through.
 pub fn mcp_servers_doc(desired: &Doc) -> Doc {
     let denied = arr(get_path(desired, "tools.denied_mcp_servers"));
     let mut out = Map::new();
@@ -815,7 +823,7 @@ pub(crate) mod tests {
             "tools": {
                 "mcp_servers": [
                     { "id": "notes", "transport": "http", "url": "https://mcp.example.com/notes", "header_names": ["x-api-key"], "enabled": true },
-                    { "id": "files@~/.claude.json", "transport": "stdio", "command": "npx", "args": ["-y", "example-files"], "env_names": ["FILES_ROOT"] },
+                    { "id": "files", "source": "~/.claude.json", "transport": "stdio", "command": "npx", "args": ["-y", "example-files"], "env_names": ["FILES_ROOT"] },
                     { "id": "off", "transport": "stdio", "command": "off-server", "enabled": false },
                     { "id": "work-chat", "transport": "stdio", "command": "chat-server" }
                 ],
@@ -952,6 +960,28 @@ pub(crate) mod tests {
 }
 "#;
         assert_eq!(pretty_json(&mcp_servers_doc(&fixture())), expected);
+    }
+
+    #[test]
+    fn apply_mcp_doc_skips_at_suffixed_duplicates() {
+        let d = json!({
+            "meta": { "instance": "alex" },
+            "tools": { "mcp_servers": [
+                { "id": "notes", "transport": "http", "url": "https://mcp.example.com/notes", "header_names": ["Authorization"] },
+                { "id": "notes@~/.claude.json#projects/~/x", "source": "~/.claude.json#projects/~/x", "transport": "stdio", "command": "notes-local" }
+            ]}
+        });
+        let doc = mcp_servers_doc(&d);
+        let servers = doc["mcpServers"].as_object().unwrap();
+        assert_eq!(servers.len(), 1, "{doc}");
+        assert_eq!(
+            servers["notes"],
+            json!({ "type": "http", "url": "https://mcp.example.com/notes", "headers": { "Authorization": "${AUTHORIZATION}" } })
+        );
+        assert_eq!(
+            doc["mcpServers"]["notes"]["headers"]["Authorization"],
+            json!("${AUTHORIZATION}")
+        );
     }
 
     #[test]
