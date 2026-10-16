@@ -26,7 +26,7 @@
 
 use crate::apply::{
     absolute_home, claude_settings_doc, instance_name, lock_doc, mcp_entry, mcp_excluded,
-    plist_loops, plist_xml, pretty_json, protected_hit, resolve, rules_md,
+    mcp_project_scoped, plist_loops, plist_xml, pretty_json, protected_hit, resolve, rules_md,
 };
 use crate::ctx::real_home;
 use crate::util::{arr, get_path, now_iso, str_list};
@@ -56,8 +56,6 @@ const CLAUDE_JSON: &str = ".claude.json";
 const AGENTS: &str = "Library/LaunchAgents";
 const STATE: &str = ".claude/setup-as-code";
 const BACKUPS: &str = ".setup-as-code/backups";
-/// `source` the MCP importer gives a server defined under `projects` in `~/.claude.json`.
-const PROJECT_SOURCE: &str = "~/.claude.json#projects/";
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Action {
@@ -415,20 +413,16 @@ fn merge_claude_json(
     let denied = arr(get_path(desired, "tools.denied_mcp_servers"));
     for server in arr(get_path(desired, "tools.mcp_servers")) {
         if mcp_excluded(server, denied) {
+            if mcp_project_scoped(server) {
+                let id = server.get("id").and_then(|v| v.as_str()).unwrap_or("?");
+                notes.push(format!(
+                    "~/{CLAUDE_JSON} mcpServers.{id} (project-scoped in setup.yaml; not added to the user scope)"
+                ));
+            }
             continue;
         }
         let (key, def) = mcp_entry(server);
         let at = format!("~/{CLAUDE_JSON} mcpServers.{key}");
-        let source = server
-            .get("source")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default();
-        if source.starts_with(PROJECT_SOURCE) {
-            notes.push(format!(
-                "{at} (project-scoped in setup.yaml; not added to the user scope)"
-            ));
-            continue;
-        }
         if !installable(&def) {
             notes.push(format!(
                 "{at} (no command or url to install; connectors and plugin servers come from their provider)"
