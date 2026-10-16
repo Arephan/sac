@@ -152,6 +152,15 @@ and `crontab -l` are spawned, once each, and only for the real home.
 - Plugin timeouts (20 s) kill the plugin process, not its process group: a wrapper script must
   `exec` its worker and must not leave children holding stdout.
 - Cron loop ids are, as in the reference, a slug of the raw command line.
+- Free text that the reference copied verbatim (permission deny/ask entries, CLAUDE.md section
+  text, memory descriptions and reasons, skill descriptions) is scrubbed like every other
+  imported string: home paths become `~/...`, secret-shaped values become `<redacted>`.
+- Text truncation counts Unicode scalar values where the reference counted UTF-16 units; only
+  text with astral characters (emoji) past the 200/240/280/400 limits differs.
+- Secret patterns use ASCII word boundaries, as JavaScript's `\b` does, so a token glued to a
+  non-ASCII letter is still caught. Files are decoded lossily (invalid UTF-8 becomes U+FFFD).
+- The planner's volatile keys (`generated_at`, `last_commit`) and the running/loaded
+  equivalence apply to an item's own fields; the reference only applied them to nested values.
 - Policy check parameters: a list parameter given as a single scalar counts as a one-item list
   (the reference iterated the characters of the string); a list parameter set to null fails the
   check closed with a `check crashed:` message, as the reference did by crashing.

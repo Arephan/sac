@@ -132,7 +132,8 @@ impl Ctx {
         if is_secret_file(&abs.to_string_lossy()) {
             bail!("refused to read secret-looking file {shown}");
         }
-        std::fs::read_to_string(&abs).with_context(|| shown)
+        let bytes = std::fs::read(&abs).with_context(|| shown)?;
+        Ok(String::from_utf8_lossy(&bytes).into_owned())
     }
     pub fn read_json(&self, rel: &str) -> Result<Doc> {
         let text = self.read_text(rel)?;

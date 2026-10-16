@@ -17,17 +17,17 @@ fn patterns() -> &'static Vec<(&'static str, Regex)> {
     static P: OnceLock<Vec<(&'static str, Regex)>> = OnceLock::new();
     P.get_or_init(|| {
         let defs: [(&str, &str); 13] = [
-            ("slack-token", r"\bxox[abposr]-[A-Za-z0-9-]{10,}"),
-            ("slack-app-token", r"\bxapp-\d-[A-Za-z0-9-]{10,}"),
-            ("openai-style-key", r"\bsk-(?:proj-|ant-)?[A-Za-z0-9_-]{20,}"),
-            ("github-token", r"\b(?:ghp|gho|ghu|ghs|ghr|github_pat)_[A-Za-z0-9_]{20,}"),
-            ("aws-access-key", r"\bAKIA[0-9A-Z]{16}\b"),
-            ("google-api-key", r"\bAIza[0-9A-Za-z_-]{35}\b"),
-            ("google-oauth-token", r"\bya29\.[0-9A-Za-z_-]{20,}"),
-            ("stripe-key", r"\b(?:sk|rk|pk)_(?:live|test)_[0-9A-Za-z]{16,}"),
+            ("slack-token", r"(?-u:\b)xox[abposr]-[A-Za-z0-9-]{10,}"),
+            ("slack-app-token", r"(?-u:\b)xapp-\d-[A-Za-z0-9-]{10,}"),
+            ("openai-style-key", r"(?-u:\b)sk-(?:proj-|ant-)?[A-Za-z0-9_-]{20,}"),
+            ("github-token", r"(?-u:\b)(?:ghp|gho|ghu|ghs|ghr|github_pat)_[A-Za-z0-9_]{20,}"),
+            ("aws-access-key", r"(?-u:\b)AKIA[0-9A-Z]{16}(?-u:\b)"),
+            ("google-api-key", r"(?-u:\b)AIza[0-9A-Za-z_-]{35}(?-u:\b)"),
+            ("google-oauth-token", r"(?-u:\b)ya29\.[0-9A-Za-z_-]{20,}"),
+            ("stripe-key", r"(?-u:\b)(?:sk|rk|pk)_(?:live|test)_[0-9A-Za-z]{16,}"),
             ("private-key-block", r"-----BEGIN (?:RSA |EC |OPENSSH |PGP )?PRIVATE KEY-----"),
-            ("jwt", r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}"),
-            ("bearer-header", r"\bBearer\s+[A-Za-z0-9._~+/-]{20,}=*"),
+            ("jwt", r"(?-u:\b)eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}"),
+            ("bearer-header", r"(?-u:\b)Bearer\s+[A-Za-z0-9._~+/-]{20,}=*"),
             ("url-credentials", r"(?i)\b[a-z][a-z0-9+.-]*://[^\s:/@]+:[^\s:/@]{6,}@"),
             (
                 "generic-assignment",
@@ -92,6 +92,12 @@ mod tests {
         assert_eq!(hits[0].id, "slack-token");
         assert_eq!(hits[0].sample, "xoxb-1…");
         assert!(find_secrets("plain text ~/.bot_token").is_empty());
+        let glued = format!("é{tok}日");
+        assert_eq!(
+            find_secrets(&glued).len(),
+            1,
+            "ASCII word boundaries, like JavaScript's"
+        );
     }
 
     #[test]
