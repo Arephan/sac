@@ -96,7 +96,7 @@ mod tests {
 
     #[test]
     fn secret_files_and_keys() {
-        assert!(is_secret_file("/Users/alex/.slack_butler_token"));
+        assert!(is_secret_file("/Users/alex/.slack_bot_token"));
         assert!(is_secret_file("~/.env.local"));
         assert!(is_secret_file("/x/credentials.json"));
         assert!(!is_secret_file("/x/settings.json"));

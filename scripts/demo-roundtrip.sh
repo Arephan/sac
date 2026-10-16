@@ -17,7 +17,7 @@ cat > "$A/.claude/settings.json" <<'EOF'
   "hooks": { "PreToolUse": [{ "matcher": "Bash", "hooks": [{ "type": "command", "command": "~/.claude/hooks/guard.sh" }] }] } }
 EOF
 cat > "$A/.claude.json" <<'EOF'
-{ "mcpServers": { "notes": { "type": "http", "url": "https://mcp.example.com/notes", "headers": { "Authorization": "Bearer not-a-real-token-abcdefghijklmnop" } } } }
+{ "mcpServers": { "notes": { "type": "http", "url": "https://mcp.example.com/notes", "headers": { "Authorization": "Bearer placeholder" } } } }
 EOF
 cat > "$A/Library/LaunchAgents/com.example.brief.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>

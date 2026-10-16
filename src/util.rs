@@ -334,7 +334,8 @@ mod tests {
         assert_eq!(expand_home("$HOME/z", &home()), "/Users/alex/z");
         assert_eq!(tilde("/Users/alex/x", &home()), "~/x");
         assert_eq!(tilde("cd /Users/alex && ls", &home()), "cd ~ && ls");
-        assert_eq!(tilde("/Users/alexandra/x", &home()), "/Users/alexandra/x");
+        let longer = format!("/Users/{}/x", "alexandra");
+        assert_eq!(tilde(&longer, &home()), longer);
     }
 
     #[test]
