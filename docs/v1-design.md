@@ -62,9 +62,9 @@ dependencies, and `doctor` checks they exist.
 my-claude/
   sac.yaml          name, when and from which Claude version it was captured, optional extends
   claude/           mirror of the saved ~/.claude items
-  mcp.json          { "mcpServers": { name: { …, "env": { "API_KEY": "${API_KEY}" } } } }
+  mcp.json          { "mcpServers": { name: { …, "env": { "API_KEY": "{{secret:API_KEY}}" } } } }
   plugins.json      { "marketplaces": [{ name, source }], "plugins": [{ id, enabled, settings }] }
-  jobs/<label>.yaml label, program, schedule, working directory, env (secrets as ${NAME}), log paths
+  jobs/<label>.yaml label, program, schedule, working directory, env (secrets as placeholders), log paths
   .env.example      one line per secret: name, where it is used, a blank value
   .gitignore        .env
 ```
@@ -79,15 +79,17 @@ extends: ["https://github.com/acme/claude-base.git"]   # optional; base layers f
 
 Paths under the Claude folder and the home directory are saved as `{{claude}}` and `{{home}}`;
 restore turns them into the new machine's paths. A `~` you wrote yourself is left alone. Secret
-values are replaced with `${NAME}`.
+values are replaced with `{{secret:NAME}}`; a `${VAR}` you wrote yourself (shell or MCP
+environment expansion) is never treated as one.
 
 ## 4. `sac save [dir]`
 
 1. Read the items of §2 from the current machine (or from `--config-dir`).
 2. Find secrets: `secretlint` (recommended preset) over every saved text, plus values under keys
    that name a credential (`env`, `headers`, and any key containing `token`, `secret`, `key`,
-   `password` or `auth`). Each one becomes `${NAME}` (the env var name where there is one, otherwise
-   a name derived from where it was found) and a line in `.env.example`.
+   `password` or `auth`). Each one becomes `{{secret:NAME}}` (the env var name where there is one,
+   otherwise a name derived from where it was found) and a line in `.env.example`. In a text file
+   only the detected token is replaced.
 3. Replace the Claude folder and home paths with `{{claude}}` and `{{home}}`.
 4. Write the repo (default `~/my-claude`), `git init` it if needed, and commit locally as
    `sac save <date>`. Never push.
@@ -104,7 +106,7 @@ values are replaced with `${NAME}`.
 2. **Plan:** compute what would change on the target and print it: file diffs, settings changes,
    marketplaces, plugins and MCP servers to add, plugin settings to apply, jobs to write. Nothing
    that already matches is touched.
-3. **Secrets:** every `${NAME}` the plan needs is taken from the environment, then from `--env-file`
+3. **Secrets:** every `{{secret:NAME}}` the plan needs is taken from the environment, then from `--env-file`
    (default: `.env` beside the top layer), then from the machine itself when an item is already
    there, then asked for with a hidden prompt. With `--yes`,
    missing secrets skip the items that need them and the run exits 1 at the end (`--allow-missing`

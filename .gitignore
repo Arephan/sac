@@ -9,3 +9,4 @@ docs/superpowers/
 target*/
 ts/dist/
 ts/node_modules/
+.vitest/
