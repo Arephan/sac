@@ -172,12 +172,12 @@ pub struct ImportArgs<'a> {
 
 /// Run the importers and assemble the live document.
 pub fn import_live(a: ImportArgs) -> Result<ImportResult> {
-    let cfg = a
-        .setup
-        .get("import")
-        .or_else(|| a.overrides.get("import"))
-        .cloned()
-        .unwrap_or(json!({}));
+    // overrides.yaml wins over setup.yaml for the import block, so a freshly scaffolded
+    // instance can set managed_prefixes and repo_roots in overrides before the first import.
+    let cfg = match (a.setup.get("import"), a.overrides.get("import")) {
+        (None, None) => json!({}),
+        (sv, ov) => deep_merge(sv, ov),
+    };
     let options = cfg.get("options").cloned().unwrap_or(json!({}));
     let ctx = Ctx::new(a.home, options.clone());
     let importers = load_importers(Some(&a.inst.dir))?;

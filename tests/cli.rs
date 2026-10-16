@@ -44,7 +44,15 @@ fn init_then_validate() {
     let v = sac(&["validate", "-i", inst.to_str().unwrap()], root);
     assert_eq!(v.code, 0, "{}", v.out());
     assert!(v.stdout.contains("VALID"), "{}", v.stdout);
-    let protected = sac(&["init", fx.home.join(".claude/x").to_str().unwrap()], root);
+    let protected = sac(
+        &[
+            "init",
+            fx.home.join(".claude/x").to_str().unwrap(),
+            "--home",
+            fx.home.to_str().unwrap(),
+        ],
+        root,
+    );
     assert_ne!(protected.code, 0);
 }
 

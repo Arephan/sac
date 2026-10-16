@@ -50,7 +50,7 @@ fn run() -> Result<i32> {
 
     match &cli.cmd {
         Cmd::Init { dir, name, force } => {
-            let r = init(dir, name.as_deref(), *force, &real_home())?;
+            let r = init(dir, name.as_deref(), *force, &home)?;
             println!(
                 "initialized instance \"{}\" in {}: {}",
                 r.instance,
