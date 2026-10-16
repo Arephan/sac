@@ -1,5 +1,6 @@
 //! Executable checks found in `<instance>/checks/`: any executable file there is a check, in
-//! any language. Hidden files (names starting with `.`) are skipped.
+//! any language. Hidden files (names starting with `.`) are skipped. Unix only for now: on
+//! other platforms no external check is loaded.
 //!
 //! Protocol:
 //! - `<exe> describe` prints `{"id": "...", "doc": "..."}`.
@@ -106,22 +107,18 @@ fn file_name(path: &Path) -> String {
 }
 
 /// A regular file (after following links) with an execute bit, not hidden.
+#[cfg(unix)]
 fn is_executable(path: &Path) -> bool {
-    if file_name(path).starts_with('.') {
-        return false;
-    }
-    let Ok(meta) = std::fs::metadata(path) else {
-        return false;
-    };
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        meta.is_file() && meta.permissions().mode() & 0o111 != 0
-    }
-    #[cfg(not(unix))]
-    {
-        meta.is_file()
-    }
+    use std::os::unix::fs::PermissionsExt;
+    !file_name(path).starts_with('.')
+        && std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+}
+
+/// Plugins are unix-only for now: without an execute bit there is no way to tell a check from
+/// a stray file such as a README, so nothing is loaded.
+#[cfg(not(unix))]
+fn is_executable(_path: &Path) -> bool {
+    false
 }
 
 /// The check's stdout parsed as one result object.
@@ -297,6 +294,32 @@ mod tests {
     }
 
     #[test]
+    fn default_timeout_is_twenty_seconds() {
+        assert_eq!(TIMEOUT, Duration::from_secs(20));
+    }
+
+    #[test]
+    fn a_result_is_one_object_with_a_known_status() {
+        let err = |stdout: &str| parse_result(stdout).err().unwrap_or_default();
+        assert_eq!(err("[1, 2]"), "stdout is not a JSON object");
+        assert_eq!(err("\"pass\""), "stdout is not a JSON object");
+        assert_eq!(err(r#"{"message": "x", "evidence": []}"#), "no status");
+        assert_eq!(err(r#"{"status": null}"#), "bad status null");
+        assert_eq!(err(r#"{"status": "PASS"}"#), "bad status \"PASS\"");
+        assert!(err("").starts_with("bad JSON on stdout"));
+        assert!(err("{\"status\":\"pass\"}\n{}").starts_with("bad JSON on stdout"));
+
+        let r = parse_result(" {\"status\":\"warn\",\"message\":\"m\",\"evidence\":[\"a\",2]}\n")
+            .unwrap();
+        assert_eq!(r.status, Status::Warn);
+        assert_eq!(r.message, "m");
+        assert_eq!(r.evidence, ["a", "2"]);
+        let r = parse_result(r#"{"status":"skip"}"#).unwrap();
+        assert_eq!(r.status, Status::Skip);
+        assert!(r.message.is_empty() && r.evidence.is_empty());
+    }
+
+    #[test]
     fn unknown_check_id_fails() {
         let mut setup = loops_setup();
         setup["safety"] = json!({ "policies": [
@@ -334,6 +357,12 @@ if mode == "garbage":
     sys.exit(0)
 if mode == "status":
     print(json.dumps({"status": "maybe", "message": "?"}))
+    sys.exit(0)
+if mode == "array":
+    print(json.dumps([1, 2]))
+    sys.exit(0)
+if mode == "nostatus":
+    print(json.dumps({"message": "no status here", "evidence": []}))
     sys.exit(0)
 if mode == "sleep":
     time.sleep(30)
@@ -427,6 +456,24 @@ else:
             let r = run("status");
             assert_eq!(r.status, Status::Fail);
             assert_eq!(r.message, "check crashed: bad status \"maybe\"");
+
+            let r = run("array");
+            assert_eq!(r.status, Status::Fail);
+            assert_eq!(r.message, "check crashed: stdout is not a JSON object");
+
+            let r = run("nostatus");
+            assert_eq!(r.status, Status::Fail);
+            assert_eq!(r.message, "check crashed: no status");
+        }
+
+        #[test]
+        fn check_killed_by_a_signal_becomes_fail() {
+            let tmp = tempfile::tempdir().unwrap();
+            let body = "#!/bin/sh\nif [ \"$1\" = describe ]; then\n  echo '{\"id\":\"sig\",\"doc\":\"Dies.\"}'\nelse\n  cat >/dev/null\n  kill -KILL $$\nfi\n";
+            let c = ExternalCheck::load(&write_exe(tmp.path(), "sig", body), TIMEOUT).unwrap();
+            let r = c.run(&loops_setup(), &json!({}), &ctx());
+            assert_eq!(r.status, Status::Fail);
+            assert_eq!(r.message, "check crashed: killed by a signal");
         }
 
         #[test]
