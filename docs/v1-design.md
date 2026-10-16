@@ -77,7 +77,9 @@ captured: { at: "2026-10-16T14:00:00Z", claude: "2.1.301", os: darwin }
 extends: ["https://github.com/acme/claude-base.git"]   # optional; base layers first
 ```
 
-Paths inside saved files use `~` for the home directory. Secret values are replaced with `${NAME}`.
+Paths under the Claude folder and the home directory are saved as `{{claude}}` and `{{home}}`;
+restore turns them into the new machine's paths. A `~` you wrote yourself is left alone. Secret
+values are replaced with `${NAME}`.
 
 ## 4. `sac save [dir]`
 
@@ -86,7 +88,7 @@ Paths inside saved files use `~` for the home directory. Secret values are repla
    that name a credential (`env`, `headers`, and any key containing `token`, `secret`, `key`,
    `password` or `auth`). Each one becomes `${NAME}` (the env var name where there is one, otherwise
    a name derived from where it was found) and a line in `.env.example`.
-3. Replace the home path with `~`.
+3. Replace the Claude folder and home paths with `{{claude}}` and `{{home}}`.
 4. Write the repo (default `~/my-claude`), `git init` it if needed, and commit locally as
    `sac save <date>`. Never push.
 5. Print a summary: what was saved, which secrets became placeholders, dependencies outside
@@ -103,7 +105,8 @@ Paths inside saved files use `~` for the home directory. Secret values are repla
    marketplaces, plugins and MCP servers to add, plugin settings to apply, jobs to write. Nothing
    that already matches is touched.
 3. **Secrets:** every `${NAME}` the plan needs is taken from the environment, then from `--env-file`
-   (default: `.env` beside the top layer), then asked for with a hidden prompt. With `--yes`,
+   (default: `.env` beside the top layer), then from the machine itself when an item is already
+   there, then asked for with a hidden prompt. With `--yes`,
    missing secrets skip the items that need them and the run exits 1 at the end (`--allow-missing`
    makes that exit 0).
 4. **Apply**, after confirmation (or `--yes`): back up every file it will overwrite to
@@ -113,7 +116,8 @@ Paths inside saved files use `~` for the home directory. Secret values are repla
 
 Flags: `--dry-run` (plan only), `--yes`, `--config-dir <dir>` (restore into a separate Claude home:
 files go there and every `claude` CLI call gets `CLAUDE_CONFIG_DIR=<dir>`, for testing and for
-fresh machines), `--load-jobs` (load written jobs with `launchctl bootstrap` or `crontab`),
+fresh machines; jobs are then written under `<dir>/sac-jobs/`, never into the real LaunchAgents),
+`--load-jobs` (load written jobs with `launchctl bootstrap` or `crontab`; refused with `--config-dir`),
 `--env-file <file>`.
 
 Restore never deletes an item that is on the machine but not in the repo; `doctor` lists those.
