@@ -18,6 +18,10 @@
 //! - launchd plists: `~/Library/LaunchAgents/<label>.plist`, disabled loops under `disabled/`,
 //!   written when missing or with `force`. `launchctl` is never run.
 //! - `~/.claude/setup-as-code/{RULES.md,setup.lock.json,report.md}`: regenerated every run.
+//! - settings.json, .claude.json or a plist into which this run would put the `<redacted>`
+//!   placeholder (where import dropped a secret-shaped value) is not written at all, whatever
+//!   `force` says; it is reported with the paths of the placeholders. A placeholder the file
+//!   already held at the same place does not count.
 //! - A malformed existing settings.json or .claude.json stops the run before any backup or write.
 //! - Containment: every path the run may write, and the backup directory, is resolved through
 //!   symlinks first, and the run is refused when one lands outside the home. For a home that is
@@ -27,8 +31,9 @@
 //! - Writes are atomic (temp file + rename) and go through a symlinked file to its target.
 
 use crate::apply::{
-    absolute_home, claude_settings_doc, instance_name, lock_doc, mcp_entry, mcp_excluded,
-    mcp_project_scoped, plist_loops, plist_xml, pretty_json, protected_hit, resolve, rules_md,
+    absolute_home, claude_settings_doc, code_list, instance_name, lock_doc, mcp_entry,
+    mcp_excluded, mcp_project_scoped, plist_loops, plist_redacted_paths, plist_xml, pretty_json,
+    protected_hit, redacted_paths, resolve, rules_md, REDACTED,
 };
 use crate::ctx::real_home;
 use crate::util::{arr, get_path, now_iso, str_list};
@@ -66,6 +71,8 @@ enum Action {
     /// Exists and is only replaced with `force`.
     Keep,
     Unchanged,
+    /// Would carry the `<redacted>` placeholder: never written.
+    Redacted,
 }
 
 /// One file the run may write, by path relative to the home.
@@ -84,6 +91,8 @@ struct Target {
     launch: bool,
     /// Names written as `${NAME}` placeholders that still need a value.
     fill_in: Vec<String>,
+    /// Where writing this file would put the `<redacted>` placeholder; any refuses the file.
+    redacted: Vec<String>,
     action: Action,
 }
 
@@ -98,6 +107,7 @@ impl Target {
             private: false,
             launch: false,
             fill_in: Vec::new(),
+            redacted: Vec::new(),
             action: Action::Create,
         }
     }
@@ -190,17 +200,24 @@ pub(crate) fn apply_live_in(desired: &Doc, opts: &LiveOptions, real: &Path) -> R
         opts.force,
         &mut notes,
     );
-    let mut t = Target::new(SETTINGS, pretty_json(&Value::Object(merged.clone())));
-    t.same_as_existing = settings == Some(merged);
-    let mut targets = vec![t];
+    // A JSON target over the file as found: only placeholders this run would add count.
+    let json_target =
+        |rel: &str, merged: Map<String, Value>, found: &Option<Map<String, Value>>| {
+            let merged = Value::Object(merged);
+            let found = found.clone().map(Value::Object);
+            let mut t = Target::new(rel, pretty_json(&merged));
+            t.redacted = redacted_paths(&merged, found.as_ref(), "");
+            t.same_as_existing = found.as_ref() == Some(&merged);
+            t
+        };
+    let mut targets = vec![json_target(SETTINGS, merged, &settings)];
     let (merged, added) = merge_claude_json(
         claude_json.clone().unwrap_or_default(),
         desired,
         opts.force,
         &mut notes,
     );
-    let mut t = Target::new(CLAUDE_JSON, pretty_json(&Value::Object(merged.clone())));
-    t.same_as_existing = claude_json == Some(merged);
+    let mut t = json_target(CLAUDE_JSON, merged, &claude_json);
     t.private = true;
     t.fill_in = added;
     targets.push(t);
@@ -209,6 +226,7 @@ pub(crate) fn apply_live_in(desired: &Doc, opts: &LiveOptions, real: &Path) -> R
         t.force_only = true;
         t.launch = *enabled;
         t.fill_in = str_list(l.get("env_names"));
+        t.redacted = plist_redacted_paths(l);
         targets.push(t);
     }
     targets.push(Target::state("RULES.md", rules_md(desired)));
@@ -220,6 +238,10 @@ pub(crate) fn apply_live_in(desired: &Doc, opts: &LiveOptions, real: &Path) -> R
     targets.push(Target::state("report.md", String::new()));
     for t in &mut targets {
         t.action = decide(home, t, opts.force)?;
+        // Skipped whole: no copy with the placeholder, and no copy that leaves it out.
+        if t.writes() && !t.redacted.is_empty() {
+            t.action = Action::Redacted;
+        }
     }
 
     let backup_dir = if targets.iter().any(|t| t.action == Action::Update) {
@@ -242,6 +264,11 @@ pub(crate) fn apply_live_in(desired: &Doc, opts: &LiveOptions, real: &Path) -> R
         .filter_map(|t| match t.action {
             Action::Keep => Some(format!("~/{} (exists; --force overwrites)", t.rel)),
             Action::Unchanged => Some(format!("~/{} (unchanged)", t.rel)),
+            Action::Redacted => Some(format!(
+                "~/{} (not written: setup.yaml would put the placeholder `{REDACTED}` at {}, where import dropped a secret-shaped value)",
+                t.rel,
+                code_list(&t.redacted)
+            )),
             _ => None,
         })
         .collect();
@@ -1503,6 +1530,103 @@ mod tests {
             "{:?}",
             r.skipped
         );
+    }
+
+    /// The note live leaves for a file it refused because of the placeholder.
+    fn placeholder_note(rel: &str, at: &str) -> String {
+        format!("~/{rel} (not written: setup.yaml would put the placeholder `<redacted>` at `{at}`, where import dropped a secret-shaped value)")
+    }
+
+    #[test]
+    fn live_never_writes_the_redacted_placeholder() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = &canon(tmp.path());
+        let d = crate::apply::tests::fixture_with_placeholders();
+        let r = live(&d, &opts(home, true, false)).unwrap();
+        // Each file the placeholder would reach is skipped whole, never written without it.
+        assert!(!home.join(".claude/settings.json").exists());
+        assert!(!home.join(".claude.json").exists());
+        assert!(!agents(home).join("com.example.morning.plist").exists());
+        assert!(agents(home)
+            .join("disabled/com.example.sweep.plist")
+            .is_file());
+        assert!(r.commands.is_empty(), "{:?}", r.commands);
+        for note in [
+            placeholder_note(".claude/settings.json", "permissions.allow[2]"),
+            placeholder_note(".claude.json", "mcpServers.files.args[1]"),
+            placeholder_note(
+                "Library/LaunchAgents/com.example.morning.plist",
+                "program[1]",
+            ),
+        ] {
+            assert!(r.skipped.contains(&note), "{note}\n{:?}", r.skipped);
+        }
+        let mut changed = r.changed.clone();
+        changed.sort();
+        assert_eq!(
+            changed,
+            [
+                "~/.claude/setup-as-code/RULES.md",
+                "~/.claude/setup-as-code/report.md",
+                "~/.claude/setup-as-code/setup.lock.json",
+                "~/Library/LaunchAgents/disabled/com.example.sweep.plist",
+            ]
+        );
+        // Only the report, which names the refused files, mentions the placeholder.
+        let report = read(&home.join(".claude/setup-as-code/report.md"));
+        assert!(
+            report.contains(&format!(
+                "- {}",
+                placeholder_note(".claude.json", "mcpServers.files.args[1]")
+            )),
+            "{report}"
+        );
+        for f in files_below(home) {
+            let text = read(&home.join(&f));
+            let carries = text.contains("<redacted>") || text.contains("&lt;redacted&gt;");
+            assert_eq!(carries, f == ".claude/setup-as-code/report.md", "{f}");
+        }
+    }
+
+    #[test]
+    fn live_leaves_existing_files_whole_when_the_placeholder_would_land_in_them() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = &canon(tmp.path());
+        std::fs::create_dir_all(home.join(".claude")).unwrap();
+        std::fs::create_dir_all(agents(home)).unwrap();
+        let settings = r#"{ "theme": "dark" }"#;
+        let claude_json = r#"{ "numStartups": 3 }"#;
+        let morning = agents(home).join("com.example.morning.plist");
+        std::fs::write(home.join(".claude/settings.json"), settings).unwrap();
+        std::fs::write(home.join(".claude.json"), claude_json).unwrap();
+        std::fs::write(&morning, "old plist").unwrap();
+
+        let d = crate::apply::tests::fixture_with_placeholders();
+        let r = live(&d, &opts(home, true, true)).unwrap();
+        assert_eq!(read(&home.join(".claude/settings.json")), settings);
+        assert_eq!(read(&home.join(".claude.json")), claude_json);
+        assert_eq!(read(&morning), "old plist");
+        assert!(r.commands.is_empty(), "{:?}", r.commands);
+        assert!(r.backup_dir.is_none(), "nothing that existed was written");
+        assert!(r.skipped.contains(&placeholder_note(
+            "Library/LaunchAgents/com.example.morning.plist",
+            "program[1]"
+        )));
+    }
+
+    #[test]
+    fn live_writes_a_file_that_already_held_the_placeholder() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = &canon(tmp.path());
+        // The word sits in the file already (say, a past prompt); this run adds none.
+        let before =
+            json!({ "projects": { "/w": { "history": [{ "display": "why <redacted>?" }] } } });
+        std::fs::write(home.join(".claude.json"), pretty_json(&before)).unwrap();
+        let r = live(&fixture(), &opts(home, true, false)).unwrap();
+        let cj = read_json(&home.join(".claude.json"));
+        assert_eq!(cj["projects"], before["projects"]);
+        assert_eq!(cj["mcpServers"], mcp_servers_doc(&fixture())["mcpServers"]);
+        assert!(r.changed.contains(&"~/.claude.json".to_string()));
     }
 
     #[cfg(unix)]

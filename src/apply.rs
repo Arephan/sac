@@ -240,6 +240,67 @@ pub(crate) fn pretty_json(v: &Doc) -> String {
     s
 }
 
+/// The placeholder import leaves where it dropped a secret-shaped value.
+pub(crate) const REDACTED: &str = "<redacted>";
+
+/// Where `new` holds the `<redacted>` placeholder, as paths like `mcpServers.files.args[1]`
+/// below `at`, object keys included. A place where `old` already holds the same value is left
+/// out, so with the file as found for `old` the result is what writing `new` would add.
+pub(crate) fn redacted_paths(new: &Doc, old: Option<&Doc>, at: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    walk_redacted(new, old, at, &mut out);
+    out
+}
+
+fn walk_redacted(new: &Doc, old: Option<&Doc>, at: &str, out: &mut Vec<String>) {
+    if old == Some(new) {
+        return;
+    }
+    match new {
+        Value::String(s) if s.contains(REDACTED) => out.push(at.to_string()),
+        Value::Array(a) => {
+            for (i, x) in a.iter().enumerate() {
+                walk_redacted(x, old.and_then(|o| o.get(i)), &format!("{at}[{i}]"), out);
+            }
+        }
+        Value::Object(m) => {
+            for (k, x) in m {
+                let p = if at.is_empty() {
+                    k.clone()
+                } else {
+                    format!("{at}.{k}")
+                };
+                let prev = old.and_then(|o| o.get(k));
+                if prev.is_none() && k.contains(REDACTED) {
+                    out.push(p);
+                } else {
+                    walk_redacted(x, prev, &p, out);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// `redacted_paths` over the fields of a loop that `plist_xml` writes as text (where the
+/// placeholder lands escaped, as `&lt;redacted&gt;`).
+pub(crate) fn plist_redacted_paths(loop_: &Doc) -> Vec<String> {
+    ["id", "program", "working_dir", "log", "env_names"]
+        .into_iter()
+        .filter_map(|k| loop_.get(k).map(|v| redacted_paths(v, None, k)))
+        .flatten()
+        .collect()
+}
+
+/// Paths as a Markdown list of code spans: `` `a`, `b` ``.
+pub(crate) fn code_list(paths: &[String]) -> String {
+    paths
+        .iter()
+        .map(|p| format!("`{p}`"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// Write claude/settings.json, claude/mcp-servers.json, claude/RULES.md, launchd plists,
 /// setup.lock.json, setup.resolved.yaml and report.md under `<out_root>/<instance>/`.
 pub fn render(
@@ -285,18 +346,26 @@ pub(crate) fn render_in(
         instance: &name,
         written: Vec::new(),
     };
-    w.write(
-        "claude/settings.json",
-        &pretty_json(&claude_settings_doc(desired)),
-    )?;
-    w.write(
-        "claude/mcp-servers.json",
-        &pretty_json(&mcp_servers_doc(desired)),
-    )?;
+    // Rendered files that carry the `<redacted>` placeholder: still written, and named in
+    // the report so nobody installs one as it is.
+    let mut redacted: Vec<String> = Vec::new();
+    let mut flag = |rel: &str, paths: Vec<String>| {
+        if !paths.is_empty() {
+            redacted.push(format!("out/{name}/{rel}: {}", code_list(&paths)));
+        }
+    };
+    let settings = claude_settings_doc(desired);
+    flag("claude/settings.json", redacted_paths(&settings, None, ""));
+    w.write("claude/settings.json", &pretty_json(&settings))?;
+    let mcp = mcp_servers_doc(desired);
+    flag("claude/mcp-servers.json", redacted_paths(&mcp, None, ""));
+    w.write("claude/mcp-servers.json", &pretty_json(&mcp))?;
     w.write("claude/RULES.md", &rules_md(desired))?;
     for (l, label, enabled) in &plists {
         let sub = if *enabled { "" } else { "disabled/" };
-        w.write(&format!("launchd/{sub}{label}.plist"), &plist_xml(l, &home))?;
+        let rel = format!("launchd/{sub}{label}.plist");
+        flag(&rel, plist_redacted_paths(l));
+        w.write(&rel, &plist_xml(l, &home))?;
     }
     let lock = lock_doc(desired, &name);
     w.write("setup.lock.json", &pretty_json(&lock))?;
@@ -316,8 +385,11 @@ pub(crate) fn render_in(
         &name,
         &at,
         desired,
-        &w.written,
-        plists.len(),
+        &Rendered {
+            written: &w.written,
+            n_plist: plists.len(),
+            redacted: &redacted,
+        },
         plan_text,
         policy_text,
     );
@@ -347,15 +419,23 @@ pub(crate) fn lock_doc(desired: &Doc, name: &str) -> Doc {
     json!({ "instance": name, "rendered_at": now_iso(), "sha256": sha, "counts": counts })
 }
 
+/// What a render wrote, for its report.
+struct Rendered<'a> {
+    written: &'a [String],
+    n_plist: usize,
+    /// `out/<instance>/<file>: <paths>` for every file carrying the `<redacted>` placeholder.
+    redacted: &'a [String],
+}
+
 fn report_md(
     name: &str,
     at: &str,
     desired: &Doc,
-    written: &[String],
-    n_plist: usize,
+    r: &Rendered,
     plan: Option<&str>,
     policy: Option<&str>,
 ) -> String {
+    let (written, n_plist) = (r.written, r.n_plist);
     let mut l: Vec<String> = vec![
         format!("# Apply report: {name}"),
         String::new(),
@@ -379,6 +459,18 @@ fn report_md(
     l.push(String::new());
     l.push(format!("launchd plists rendered: {n_plist} (enabled at top level, disabled under launchd/disabled/). Install by hand if wanted."));
     l.push(String::new());
+    if !r.redacted.is_empty() {
+        l.push("## Redacted values".into());
+        l.push(String::new());
+        l.push(format!(
+            "Import put the placeholder `{REDACTED}` where it dropped a secret-shaped value, and \
+             these files are rendered with it in place. Put the real value in by hand before \
+             installing one; `apply --live` refuses to write a file that would carry it."
+        ));
+        l.push(String::new());
+        l.extend(r.redacted.iter().map(|x| format!("- {x}")));
+        l.push(String::new());
+    }
     let mut section = |title: &str, body: &str| {
         for x in [title, "", "```", body, "```", ""] {
             l.push(x.to_string());
@@ -920,6 +1012,19 @@ pub(crate) mod tests {
         })
     }
 
+    /// `fixture()` with the placeholder import leaves where it dropped a secret-shaped value:
+    /// in a permission rule, in an MCP server's arguments and in the enabled loop's program.
+    pub(crate) fn fixture_with_placeholders() -> Doc {
+        let mut d = fixture();
+        d["tools"]["permissions"]["allow"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!("<redacted>"));
+        d["tools"]["mcp_servers"][1]["args"][1] = json!("<redacted>");
+        d["loops"][0]["program"][1] = json!("<redacted>");
+        d
+    }
+
     fn find_on_path(name: &str) -> Option<PathBuf> {
         let path = std::env::var_os("PATH")?;
         std::env::split_paths(&path)
@@ -1279,6 +1384,80 @@ Rendered by setup-as-code on {} from setup.yaml. 3 active rules.
         let report2 = read(&r2.out_dir.join("report.md"));
         assert!(!report2.contains("## Plan") && !report2.contains("## Policy"));
         assert!(report2.ends_with("Install by hand if wanted.\n"));
+    }
+
+    #[test]
+    fn apply_render_keeps_placeholders_and_lists_them_in_the_report() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let out = tmp.path().join("out");
+        let d = fixture_with_placeholders();
+        let r = render_t(&d, &out, &home, None, Some("plan: nothing to do")).unwrap();
+        // Rendered all the same, placeholder included.
+        assert_eq!(r.written.len(), 8);
+        let plist = read(&r.out_dir.join("launchd/com.example.morning.plist"));
+        assert!(
+            plist.contains("<string>&lt;redacted&gt;</string>"),
+            "{plist}"
+        );
+        let mcp = read(&r.out_dir.join("claude/mcp-servers.json"));
+        assert!(mcp.contains("\"<redacted>\""), "{mcp}");
+        let report = read(&r.out_dir.join("report.md"));
+        let section = "Install by hand if wanted.\n\n\
+            ## Redacted values\n\n\
+            Import put the placeholder `<redacted>` where it dropped a secret-shaped value, and \
+            these files are rendered with it in place. Put the real value in by hand before \
+            installing one; `apply --live` refuses to write a file that would carry it.\n\n\
+            - out/alex/claude/settings.json: `permissions.allow[2]`\n\
+            - out/alex/claude/mcp-servers.json: `mcpServers.files.args[1]`\n\
+            - out/alex/launchd/com.example.morning.plist: `program[1]`\n\n\
+            ## Plan at apply time\n";
+        assert!(report.contains(section), "{report}");
+    }
+
+    #[test]
+    fn apply_redacted_paths_name_what_a_write_would_add() {
+        let new = json!({
+            "a": ["x", "<redacted>"],
+            "b": { "<redacted>": 1, "c": "pre <redacted> post" },
+            "d": "<redacted>",
+            "e": "redacted"
+        });
+        assert_eq!(
+            redacted_paths(&new, None, ""),
+            ["a[1]", "b.<redacted>", "b.c", "d"]
+        );
+        // What the file as found already holds at the same place is not added by the write.
+        let old = json!({ "a": ["y", "<redacted>"], "d": "<redacted>" });
+        assert_eq!(
+            redacted_paths(&new, Some(&old), ""),
+            ["b.<redacted>", "b.c"]
+        );
+        assert!(redacted_paths(&new, Some(&new), "").is_empty());
+        assert_eq!(
+            redacted_paths(&json!(["<redacted>"]), None, "program"),
+            ["program[0]"]
+        );
+
+        // A plist carries a loop's text fields; `schedule.watch_paths` and `notes` never reach it.
+        let l = json!({
+            "id": "x", "program": ["/bin/true"], "working_dir": "<redacted>",
+            "log": "~/<redacted>.log", "env_names": ["<redacted>"],
+            "schedule": { "watch_paths": ["<redacted>"] }, "notes": "<redacted>"
+        });
+        assert_eq!(
+            plist_redacted_paths(&l),
+            ["working_dir", "log", "env_names[0]"]
+        );
+        let xml = plist_xml(&l, Path::new("/Users/example"));
+        // working_dir once, log as both output paths, the env name as key and placeholder
+        assert_eq!(xml.matches("&lt;redacted&gt;").count(), 5, "{xml}");
+        assert_eq!(
+            plist_redacted_paths(&fixture_with_placeholders()["loops"][0]),
+            ["program[1]"]
+        );
+        assert!(plist_redacted_paths(&fixture()["loops"][0]).is_empty());
     }
 
     #[test]
