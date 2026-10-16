@@ -1336,6 +1336,30 @@ mod tests {
     }
 
     #[test]
+    fn live_and_render_both_skip_a_project_scoped_server() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = &canon(tmp.path());
+        // `proj` has a unique bare name, so no `@` rule applies: only its source scopes it.
+        let d = json!({
+            "version": 1,
+            "meta": { "instance": "alex" },
+            "tools": { "mcp_servers": [
+                { "id": "notes", "source": "~/.claude.json", "transport": "http", "url": "https://mcp.example.com/notes" },
+                { "id": "proj", "source": "~/.claude.json#projects/~/work", "transport": "stdio", "command": "proj-server" }
+            ]}
+        });
+        let rendered = mcp_servers_doc(&d);
+        assert!(rendered["mcpServers"].get("proj").is_none(), "{rendered}");
+        assert!(rendered["mcpServers"].get("notes").is_some(), "{rendered}");
+
+        let r = live(&d, &opts(home, true, false)).unwrap();
+        let servers = read_json(&home.join(".claude.json"))["mcpServers"].clone();
+        assert_eq!(servers, rendered["mcpServers"]);
+        let note = "~/.claude.json mcpServers.proj (project-scoped in setup.yaml; not added to the user scope)";
+        assert!(r.skipped.contains(&note.to_string()), "{:?}", r.skipped);
+    }
+
+    #[test]
     fn live_absent_manifest_sections_leave_live_keys_alone() {
         let tmp = tempfile::tempdir().unwrap();
         let home = &canon(tmp.path());
