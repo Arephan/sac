@@ -239,10 +239,13 @@ fn run_with_path(ctx: &Ctx, opts: &Doc, path_var: Option<&OsStr>) -> Result<Doc>
                 "path".into(),
                 json!(ctx.tilde(&ctx.p(&rel).to_string_lossy())),
             );
-            let remote = ctx
-                .read_text(&format!("{git}/config"))
+            // Read `.git/config` directly rather than through `ctx.read_text`: the secret-file
+            // rule there tests the whole path, so a repo such as `~/tiktoken` or
+            // `~/secret-santa` would lose its remote. This file name is fixed and never holds a
+            // credential; the URL inside is stripped and scrubbed below.
+            let remote = std::fs::read(ctx.p(&format!("{git}/config")))
                 .ok()
-                .and_then(|t| origin_url(&t));
+                .and_then(|bytes| origin_url(&String::from_utf8_lossy(&bytes)));
             if let Some(r) = remote {
                 m.insert(
                     "remote".into(),
@@ -350,6 +353,39 @@ mod tests {
             out["infra"]["repos"],
             json!([{ "id": "tool", "path": "~/code/tool", "remote": "https://example.com/alex/tool.git" }])
         );
+    }
+
+    #[test]
+    fn repo_names_that_look_like_secrets_keep_their_remote() {
+        let tmp = tempfile::tempdir().unwrap();
+        let t = tmp.path();
+        for name in ["tiktoken", "tokenizers", "secret-santa", "token-lab/inner"] {
+            write(
+                &t.join(format!("{name}/.git/config")),
+                &format!("[remote \"origin\"]\n\turl = https://example.com/alex/{name}.git\n"),
+            );
+        }
+        let ctx = Ctx::new(Some(t), json!({}));
+        let out = run_with_path(&ctx, &json!({}), Some(&no_path())).unwrap();
+        assert_eq!(
+            out["infra"]["repos"],
+            json!([
+                { "id": "secret-santa", "path": "~/secret-santa", "remote": "https://example.com/alex/secret-santa.git" },
+                { "id": "tiktoken", "path": "~/tiktoken", "remote": "https://example.com/alex/tiktoken.git" },
+                { "id": "tokenizers", "path": "~/tokenizers", "remote": "https://example.com/alex/tokenizers.git" }
+            ])
+        );
+        let out = run_with_path(
+            &ctx,
+            &json!({ "repo_roots": ["~/token-lab"] }),
+            Some(&no_path()),
+        )
+        .unwrap();
+        assert_eq!(
+            out["infra"]["repos"],
+            json!([{ "id": "inner", "path": "~/token-lab/inner", "remote": "https://example.com/alex/token-lab/inner.git" }])
+        );
+        assert!(ctx.warnings().is_empty(), "{:?}", ctx.warnings());
     }
 
     #[test]
