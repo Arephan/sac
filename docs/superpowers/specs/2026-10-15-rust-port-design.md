@@ -133,6 +133,25 @@ and `crontab -l` are spawned, once each, and only for the real home.
 - `lint` scans the working directory by default, skipping `target/`, `node_modules/`, `out/`,
   `.git/` and `instance/`.
 - `apply --live` exists.
+- `overrides.yaml`'s `import` block merges over `setup.yaml`'s (overrides win), so a freshly
+  scaffolded instance can set `managed_prefixes` and `repo_roots` before the first import.
+- `init` protects the `--home` sandbox's live-config paths, not only the real home's.
+- `claude/mcp-servers.json` (render) and `apply --live` skip MCP servers whose id contains `@`
+  (project-scoped or source-suffixed duplicates), so a project server never overwrites the
+  user-scoped entry of the same name. Live also skips servers with neither command nor url.
+- `apply --live` never writes `settings.json` `env` values (the manifest holds names only); the
+  names that need values are listed in the live `report.md`. `hooks` is replaced as a whole.
+- launchd `schedule.watch_paths` is written with `~` paths; `schedule.calendar` keeps the key
+  order of the plist file, where the reference used the order `plutil` happened to emit.
+- External plugin output is scrubbed like built-in output; a fragment that is not a JSON
+  object is rejected; dotfiles and `name~` backups in `importers/` and `checks/` are skipped.
+- `managed_prefixes` and `repo_roots` accept a single string as well as a list.
+- `infra.repos[].remote` comes from `.git/config`'s `[remote "origin"] url` only; `insteadOf`
+  rewrites, includes and global git config are not applied. `infra.machine.node` is dropped;
+  on Linux `os` is `PRETTY_NAME` from `/etc/os-release`.
+- Plugin timeouts (20 s) kill the plugin process, not its process group: a wrapper script must
+  `exec` its worker and must not leave children holding stdout.
+- Cron loop ids are, as in the reference, a slug of the raw command line.
 
 ## Safety contract (unchanged, enforced in code and tests)
 

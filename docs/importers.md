@@ -90,3 +90,5 @@ Rules for importers:
 4. Give items stable ids so `plan` can diff them across runs.
 5. Keep personal specifics out of the importer: take them from the options on stdin.
 6. Use `~/...` paths in the fragment, never the absolute home.
+7. Finish within 20 seconds. The timeout kills the plugin process only, so a wrapper script
+   must `exec` its worker and must not leave background children holding stdout.
