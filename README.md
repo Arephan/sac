@@ -70,7 +70,8 @@ sac apply -i instance/me && ls out/me
 
 Want to try it without touching your real home? Add `--home /tmp/empty-home` (an existing folder)
 to any import, plan, verify or apply command and the importers read that folder instead. If your
-instance lives outside `./instance/`, pass `--instance-root <dir>` to `lint` so it learns your terms. `scripts/demo-roundtrip.sh`
+instance lives outside `./instance/`, pass `--instance-root <dir>` (the folder that contains your
+instance folders) to `lint` so it learns your terms. `scripts/demo-roundtrip.sh`
 does the whole loop in a temp directory: capture home A, rebuild it into empty home B, show that
 B now matches.
 
@@ -98,7 +99,7 @@ are importer options set in the instance.
 | `plan [-i dir] [--home h] [--json] [-v]` | instance + machine | nothing | 0 |
 | `verify [-i dir] [--home h] [--fail-on-drift] [--json]` | instance + machine | nothing | 1 hard failure, 2 drift with the flag |
 | `apply [-i dir] [--out o]` | instance + machine (for the plan in report.md) | `<out>/<instance>/` only | 1 if invalid or a hard policy fails |
-| `apply --live --yes [--home h] [--force]` | instance | the home's live config, after backups | 1 on refusal |
+| `apply --live --yes [--home h] [--force]` | instance + machine | the home's live config, after backups | 1 on refusal |
 | `lint [paths...] [--instance-root dir]` | files | nothing | 1 on any finding |
 | `redact -i dir --out d` | instance | `d/setup.yaml`, a shape-only copy | 1 if the result is invalid |
 | `layers`, `importers` | | | 0 |

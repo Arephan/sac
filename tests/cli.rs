@@ -732,3 +732,40 @@ fn dump_fixture_for_scripts() {
     common::copy_tree(&inst, &out.join("instance/alex"));
     eprintln!("fixture written to {}", out.display());
 }
+
+#[test]
+fn apply_refuses_secret_values_with_or_without_the_policy() {
+    let fx = build_home();
+    let root = fx.tmp.path();
+    let inst = init_instance(root, "alex");
+    let home = fx.home.to_str().unwrap();
+    let i = inst.to_str().unwrap();
+    assert_eq!(sac(&["import", "-i", i, "--home", home], root).code, 0);
+    let token = ["xoxb-", "1234567890-abcdefghij"].concat();
+    let yaml = fs::read_to_string(inst.join("setup.yaml")).unwrap();
+    assert!(yaml.contains("\nvars:\n"), "{yaml}");
+    let leaky = yaml.replacen("\nvars:\n", &format!("\nvars:\n  leak: \"{token}\"\n"), 1);
+    fs::write(inst.join("setup.yaml"), leaky).unwrap();
+    // with the template policies the hard secrets_by_reference check fails verify
+    let v = sac(&["verify", "-i", i, "--home", home], root);
+    assert_eq!(v.code, 1, "{}", v.out());
+    assert!(v.stdout.contains("secrets-by-reference"), "{}", v.stdout);
+    // and apply refuses even when no policy is declared at all
+    fs::write(inst.join("policies.yaml"), "safety:\n  policies: []\n").unwrap();
+    let out = root.join("out");
+    let a = sac(
+        &[
+            "apply",
+            "-i",
+            i,
+            "--home",
+            home,
+            "--out",
+            out.to_str().unwrap(),
+        ],
+        root,
+    );
+    assert_eq!(a.code, 1, "{}", a.out());
+    assert!(a.stdout.contains("secret-shaped"), "{}", a.out());
+    assert!(!out.join("alex").exists(), "nothing may be rendered");
+}

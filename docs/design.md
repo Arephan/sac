@@ -51,8 +51,9 @@ Enforced in code and covered by tests:
 - Env var and HTTP header values are imported as names only; secret-shaped strings are dropped
   with a warning. Free text (rules, descriptions, permission entries) is scrubbed too.
 - `${env:NAME}` is never expanded inside keys that name a credential (`credential_ref`, `env`,
-  `headers`, `token`, ...), and any secret-shaped value in the desired state becomes
-  `<redacted>` before it can be rendered.
+  `headers`, `token`, ...). `apply` refuses to render a desired state that holds a
+  secret-shaped value, with or without the `secrets_by_reference` policy, and `verify` fails
+  hard on it when the policy is declared.
 - `apply` writes only below the out root, refuses an out root or instance directory inside live
   config (`~/.claude`, `~/.claude.json`, `~/Library/LaunchAgents`, `~/Library/LaunchDaemons`,
   `/Library`, `/etc`, `/System`, `~/.config/systemd`), and refuses to write through symlinks.

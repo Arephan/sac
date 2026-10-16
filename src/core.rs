@@ -114,29 +114,7 @@ pub fn desired_state(loaded: &Loaded) -> Doc {
         .map(|s| json!({ "safety": s }));
     let merged = deep_merge(Some(&loaded.setup), pol.as_ref());
     let vars = merged.get("vars").cloned().unwrap_or(json!({}));
-    normalize(redact_secret_values(resolve_vars(&merged, &vars)))
-}
-
-/// Replace any secret-shaped string in a document with `<redacted>`. The desired state is
-/// rendered into out/ and merged into live config, so a value that looks like a credential
-/// must never travel with it.
-fn redact_secret_values(v: Doc) -> Doc {
-    match v {
-        Value::String(s) => {
-            if crate::secrets::find_secrets(&s).is_empty() {
-                Value::String(s)
-            } else {
-                Value::String("<redacted>".to_string())
-            }
-        }
-        Value::Array(a) => Value::Array(a.into_iter().map(redact_secret_values).collect()),
-        Value::Object(o) => Value::Object(
-            o.into_iter()
-                .map(|(k, x)| (k, redact_secret_values(x)))
-                .collect(),
-        ),
-        other => other,
-    }
+    normalize(resolve_vars(&merged, &vars))
 }
 
 /// Collection and scalar paths a fragment actually returned (even when empty).
@@ -482,15 +460,15 @@ mod tests {
         let d = desired_state(&loaded);
         assert_eq!(d["projects"][0]["path"], json!("/r/p"));
         assert_eq!(d["safety"]["policies"][0]["id"], json!("a"));
+        // the desired state keeps values as written so the secrets_by_reference policy sees them
         let tok = ["xoxb-", "1234567890-abcdefghij"].concat();
         let leaky = Loaded {
             setup: json!({ "version": 1, "meta": { "instance": "x" }, "identity": { "accounts": [{ "id": "a", "kind": "k", "access": "read_only", "note": tok }] } }),
             overrides: json!({}),
             policies: json!({}),
         };
-        assert_eq!(
-            desired_state(&leaky)["identity"]["accounts"][0]["note"],
-            json!("<redacted>")
-        );
+        let d = desired_state(&leaky);
+        assert_eq!(d["identity"]["accounts"][0]["note"], json!(tok));
+        assert_eq!(crate::util::secret_paths(&d).len(), 1);
     }
 }

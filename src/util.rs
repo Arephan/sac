@@ -300,6 +300,38 @@ pub fn one_line(s: &str, max: usize) -> String {
     }
 }
 
+/// Dotted paths of every secret-shaped string in a document (`a.b[2].c: slack-token`).
+pub fn secret_paths(doc: &Doc) -> Vec<String> {
+    fn walk(v: &Doc, at: &str, out: &mut Vec<String>) {
+        match v {
+            Value::String(s) => {
+                for h in crate::secrets::find_secrets(s) {
+                    out.push(format!("{at}: {}", h.id));
+                }
+            }
+            Value::Array(a) => {
+                for (i, x) in a.iter().enumerate() {
+                    walk(x, &format!("{at}[{i}]"), out);
+                }
+            }
+            Value::Object(o) => {
+                for (k, x) in o {
+                    let p = if at.is_empty() {
+                        k.clone()
+                    } else {
+                        format!("{at}.{k}")
+                    };
+                    walk(x, &p, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    walk(doc, "", &mut out);
+    out
+}
+
 /// The strings of an array value; anything else is empty.
 pub fn str_list(v: Option<&Doc>) -> Vec<String> {
     match v {

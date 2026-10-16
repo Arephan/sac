@@ -61,7 +61,6 @@ fn home_rule_paths(rule: &str, home: &str) -> String {
     while let Some(offset) = rule[from..].find(&needle) {
         let start = from + offset;
         let end = start + needle.len();
-        // `map_or(true, ..)` rather than `is_none_or`, which is newer than the crate's MSRV
         let bounded = rule[end..]
             .chars()
             .next()
