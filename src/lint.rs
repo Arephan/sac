@@ -104,9 +104,9 @@ fn patterns() -> &'static Patterns {
     })
 }
 
-/// JavaScript `String.prototype.trim`.
+/// JavaScript `String.prototype.trim` (it trims exactly the `\s` set).
 fn js_trim(s: &str) -> &str {
-    s.trim_matches(|c: char| (c.is_whitespace() && c != '\u{85}') || c == '\u{feff}')
+    s.trim_matches(is_js_space)
 }
 
 /// JavaScript `\s`.
@@ -184,7 +184,9 @@ fn terms_from_doc(s: &Doc, origin: &str, terms: &mut IndexMap<String, String>) {
         for v in [a.get("principal"), workspace] {
             for piece in p.piece_split.split(&text_of(v)) {
                 let piece = js_trim(piece);
-                for tok in piece.split_whitespace() {
+                // `piece.trim().split(/\s+/)`: the piece is trimmed, so only runs inside it
+                // leave empty pieces behind.
+                for tok in piece.split(is_js_space).filter(|t| !t.is_empty()) {
                     if tok.contains(['@', '.'])
                         || p.upper_token.is_match(tok)
                         || tok.starts_with("u/")
@@ -497,10 +499,8 @@ pub fn lint(
         let Ok(bytes) = std::fs::read(f) else {
             continue;
         };
-        // Binary content (a NUL byte) is counted but not scanned.
-        if bytes.contains(&0) {
-            continue;
-        }
+        // Lossy like the reference's `readFileSync(f, 'utf8')`: NUL bytes and invalid UTF-8
+        // never stop a file from being scanned.
         let text = String::from_utf8_lossy(&bytes);
         for (i, raw) in text.split('\n').enumerate() {
             let at = format!("{rel}:{}", i + 1);
@@ -807,7 +807,6 @@ mod tests {
         ] {
             write(&root.join(f), &canary);
         }
-        write(&root.join("x/blob"), &format!("\0\0binary {}", email()));
         write(&root.join("x/big.md"), &"a".repeat(5_000_000));
         let r = lint(root, &[root.to_path_buf()], &IndexMap::new(), &[]);
         let mut at: Vec<String> = r.findings.iter().map(|f| f.at.clone()).collect();
@@ -825,7 +824,7 @@ mod tests {
                 "x/f.json:1"
             ]
         );
-        assert_eq!(r.files, 9, "eight text files plus the binary blob");
+        assert_eq!(r.files, 8);
         // A relative target resolves against the root; a missing one is skipped.
         let r2 = lint(
             root,
@@ -835,6 +834,38 @@ mod tests {
         );
         assert_eq!(r2.files, 1);
         assert_eq!(r2.findings[0].at, "src/a.rs:1");
+    }
+
+    #[test]
+    fn lint_scans_nul_bytes_and_invalid_utf8_lossily() {
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path();
+        let mut bytes = b"\0\0binary\0".to_vec();
+        bytes.extend_from_slice(format!(" mail {}\n", email()).as_bytes());
+        bytes.extend_from_slice(b"caf\xe9 \xff\xfe ");
+        bytes.extend_from_slice(format!("{}\n", phone()).as_bytes());
+        fs::write(root.join("blob"), &bytes).unwrap();
+        let r = lint(root, &[root.join("blob")], &IndexMap::new(), &[]);
+        assert_eq!(r.files, 1);
+        assert_eq!(
+            kinds(&r),
+            vec![
+                ("email".to_string(), "blob:1".to_string(), email()),
+                ("phone".to_string(), "blob:2".to_string(), phone()),
+            ]
+        );
+    }
+
+    #[test]
+    fn lint_principal_tokens_split_on_javascript_whitespace() {
+        // U+FEFF separates tokens in JavaScript `\s`; U+0085 does not.
+        let doc = serde_json::json!({ "identity": { "accounts": [
+            { "id": "a", "principal": "alex@example.com\u{feff}bob.k x.y\u{85}z.w" }
+        ] } });
+        let mut terms = IndexMap::new();
+        terms_from_doc(&doc, "o", &mut terms);
+        let got: Vec<&str> = terms.keys().map(|k| k.as_str()).collect();
+        assert_eq!(got, vec!["alex@example.com", "bob.k", "x.y\u{85}z.w"]);
     }
 
     #[cfg(unix)]

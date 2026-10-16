@@ -95,10 +95,11 @@ pub fn init(dir: &Path, name: Option<&str>, force: bool, home: &Path) -> Result<
         ("lint-denylist.txt", DENYLIST_TEMPLATE.to_string()),
     ];
     std::fs::create_dir_all(&abs).with_context(|| format!("creating {}", abs.display()))?;
+    // Anything at the name clashes, a dangling symlink included (`exists()` would miss it).
     let clash: Vec<&str> = files
         .iter()
         .map(|(f, _)| *f)
-        .filter(|f| abs.join(f).exists())
+        .filter(|f| abs.join(f).symlink_metadata().is_ok())
         .collect();
     if !clash.is_empty() && !force {
         bail!(
@@ -106,6 +107,16 @@ pub fn init(dir: &Path, name: Option<&str>, force: bool, home: &Path) -> Result<
             abs.display(),
             clash.join(", ")
         );
+    }
+    // Even with --force, never write through a symlink: its target can be anywhere, such as
+    // ~/.claude. Checked for all four before the first write, so a refusal writes nothing.
+    for (f, _) in &files {
+        let p = abs.join(f);
+        if p.symlink_metadata()
+            .is_ok_and(|m| m.file_type().is_symlink())
+        {
+            bail!("refusing to write through symlink {}", p.display());
+        }
     }
     for (f, text) in &files {
         let p = abs.join(f);
@@ -256,5 +267,77 @@ mod tests {
             "{e}"
         );
         assert!(!other.join("setup.yaml").exists());
+    }
+
+    fn names_in(dir: &Path) -> Vec<String> {
+        let mut v: Vec<String> = fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        v.sort();
+        v
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn init_treats_a_dangling_symlink_as_a_clash() {
+        let t = tempfile::tempdir().unwrap();
+        let home = t.path().join("home");
+        let outside = t.path().join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        let dir = t.path().join("inst");
+        fs::create_dir_all(&dir).unwrap();
+        std::os::unix::fs::symlink(outside.join("planted.yaml"), dir.join("setup.yaml")).unwrap();
+        let e = init(&dir, None, false, &home).err().expect("clash");
+        assert_eq!(
+            e.to_string(),
+            format!(
+                "{} already has setup.yaml (use --force to overwrite)",
+                dir.display()
+            )
+        );
+        let e = init(&dir, None, true, &home).err().expect("refused");
+        assert_eq!(
+            e.to_string(),
+            format!(
+                "refusing to write through symlink {}",
+                dir.join("setup.yaml").display()
+            )
+        );
+        assert!(names_in(&outside).is_empty(), "nothing written outside");
+        assert_eq!(names_in(&dir), vec!["setup.yaml"], "nothing written inside");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn init_refuses_to_write_through_a_symlink_even_with_force() {
+        let t = tempfile::tempdir().unwrap();
+        let home = t.path().join("home");
+        let outside = t.path().join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("live.yaml"), "keep me").unwrap();
+        let dir = t.path().join("inst");
+        init(&dir, None, false, &home).unwrap();
+        fs::remove_file(dir.join("policies.yaml")).unwrap();
+        std::os::unix::fs::symlink(outside.join("live.yaml"), dir.join("policies.yaml")).unwrap();
+        fs::write(dir.join("setup.yaml"), "edited by hand").unwrap();
+        let e = init(&dir, None, true, &home).err().expect("refused");
+        assert_eq!(
+            e.to_string(),
+            format!(
+                "refusing to write through symlink {}",
+                dir.join("policies.yaml").display()
+            )
+        );
+        assert_eq!(
+            fs::read_to_string(outside.join("live.yaml")).unwrap(),
+            "keep me"
+        );
+        assert_eq!(names_in(&outside), vec!["live.yaml"]);
+        assert_eq!(
+            fs::read_to_string(dir.join("setup.yaml")).unwrap(),
+            "edited by hand",
+            "no file is written when one is refused"
+        );
     }
 }
