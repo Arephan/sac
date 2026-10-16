@@ -43,6 +43,40 @@ fn uniq(lists: &[Option<&Doc>]) -> Vec<Doc> {
     out
 }
 
+/// Claude Code writes an absolute path in a permission rule with a leading `//`
+/// (`Read(//<home>/.ssh/**)`); `~/` is relative to the home and a single leading `/` to the
+/// settings file. `//<home>/x` becomes `~/x` and a bare `//<home>` becomes `~` here, before the
+/// generic scrub, which would otherwise leave `/~/x`: a different path. A match must not follow
+/// another `/` (three slashes are not the documented form), and a bare home must be followed by
+/// the end of the text, whitespace, a quote or `)`, so a sibling such as `<home>-old` is left
+/// alone. Paths outside the home keep their `//` form.
+fn home_rule_paths(rule: &str, home: &str) -> String {
+    if home.len() <= 1 {
+        return rule.to_string();
+    }
+    let needle = format!("/{home}");
+    let mut out = String::with_capacity(rule.len());
+    let (mut copied, mut from) = (0, 0);
+    while let Some(offset) = rule[from..].find(&needle) {
+        let start = from + offset;
+        let end = start + needle.len();
+        // `map_or(true, ..)` rather than `is_none_or`, which is newer than the crate's MSRV
+        let bounded = rule[end..].chars().next().map_or(true, |c| {
+            matches!(c, '/' | ')' | '"' | '\'') || c.is_whitespace()
+        });
+        if bounded && !rule[..start].ends_with('/') {
+            out.push_str(&rule[copied..start]);
+            out.push('~');
+            copied = end;
+            from = end;
+        } else {
+            from = start + 1;
+        }
+    }
+    out.push_str(&rule[copied..]);
+    out
+}
+
 /// One entry per hook command, keyed `<event>-<matcher or any>-<last path segment>`.
 fn hook_list(ctx: &Ctx, settings: &Doc) -> Vec<Doc> {
     let mut out = Vec::new();
@@ -132,11 +166,16 @@ impl Importer for ClaudeSettings {
             permissions.insert("default_mode".into(), mode.clone());
         }
         // All three lists are scrubbed. The reference scrubs only `allow`; scrubbing `deny`
-        // and `ask` too keeps home paths and secret-shaped values out of the manifest.
+        // and `ask` too keeps home paths and secret-shaped values out of the manifest. Rules in
+        // Claude Code's `//<home>` form are rewritten to `~` first so they keep their meaning.
+        let home = ctx.home().to_string_lossy().to_string();
         for key in ["allow", "deny", "ask"] {
             let list: Vec<Doc> = uniq(&[perms.get(key), local_perms.get(key)])
                 .iter()
-                .map(|x| ctx.scrub(x))
+                .map(|x| match x {
+                    Value::String(rule) => ctx.scrub(&Value::String(home_rule_paths(rule, &home))),
+                    other => ctx.scrub(other),
+                })
                 .collect();
             permissions.insert(key.into(), Value::Array(list));
         }
@@ -315,6 +354,59 @@ mod tests {
         let text = f.to_string();
         assert!(!text.contains("xoxb"), "a token leaked: {text}");
         assert!(!text.contains(&h.s()), "a home path leaked: {text}");
+    }
+
+    #[test]
+    fn settings_double_slash_home_rules_become_tilde_paths() {
+        let h = home();
+        // `@HOME@` is the absolute home, so `/@HOME@` is Claude Code's `//<home>` form.
+        h.write(
+            ".claude/settings.json",
+            r#"{
+              "permissions": {
+                "allow": ["Read(/@HOME@/notes/**)", "Edit(/@HOME@)"],
+                "deny": ["Read(/@HOME@/.ssh/**)", "Read(/@HOME@/.config/app/*.json)"],
+                "ask": ["Edit(/@HOME@/.zshrc)", "Bash(cat /@HOME@/notes/todo.md)"]
+              }
+            }"#,
+        );
+        let ctx = h.ctx();
+        let f = ClaudeSettings.run(&ctx, &json!({})).unwrap();
+        assert_eq!(
+            f["tools"]["permissions"],
+            json!({
+                "allow": ["Read(~/notes/**)", "Edit(~)"],
+                "deny": ["Read(~/.ssh/**)", "Read(~/.config/app/*.json)"],
+                "ask": ["Edit(~/.zshrc)", "Bash(cat ~/notes/todo.md)"]
+            })
+        );
+        assert!(ctx.warnings().is_empty());
+    }
+
+    #[test]
+    fn settings_double_slash_rules_outside_the_home_stay_untouched() {
+        let h = home();
+        h.write(
+            ".claude/settings.json",
+            r#"{
+              "permissions": {
+                "allow": ["Read(//etc/hosts)", "Read(/@HOME@-old/**)"],
+                "deny": ["Read(//opt/shared/**)", "Read(/@HOME@x)"],
+                "ask": ["Edit(//tmp/scratch/*)"]
+              }
+            }"#,
+        );
+        let f = ClaudeSettings.run(&h.ctx(), &json!({})).unwrap();
+        let home = h.s();
+        // a sibling of the home (`<home>-old`, `<home>x`) is not the home and keeps its path
+        assert_eq!(
+            f["tools"]["permissions"],
+            json!({
+                "allow": ["Read(//etc/hosts)", format!("Read(/{home}-old/**)")],
+                "deny": ["Read(//opt/shared/**)", format!("Read(/{home}x)")],
+                "ask": ["Edit(//tmp/scratch/*)"]
+            })
+        );
     }
 
     #[test]
