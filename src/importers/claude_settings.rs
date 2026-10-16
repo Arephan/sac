@@ -46,11 +46,11 @@ fn uniq(lists: &[Option<&Doc>]) -> Vec<Doc> {
 
 /// Claude Code writes an absolute path in a permission rule with a leading `//`
 /// (`Read(//<home>/.ssh/**)`); `~/` is relative to the home and a single leading `/` to the
-/// settings file. `//<home>/x` becomes `~/x` and a bare `//<home>` becomes `~` here, before the
-/// generic scrub, which would otherwise leave `/~/x`: a different path. A match must not follow
-/// another `/` (three slashes are not the documented form), and a bare home must be followed by
-/// the end of the text, whitespace, a quote or `)`, so a sibling such as `<home>-old` is left
-/// alone. Paths outside the home keep their `//` form.
+/// settings file. `//<home>/x` becomes `~/x` and a bare `//<home>` becomes `~`, which Claude
+/// Code reads identically; this is the only rewrite a non-Bash rule gets. A match must not
+/// follow another `/` (three slashes are not the documented form), and a bare home must be
+/// followed by the end of the text, whitespace, a quote or `)`, so a sibling such as
+/// `<home>-old` is left alone. Paths outside the home keep their `//` form.
 fn home_rule_paths(rule: &str, home: &str) -> String {
     if home.len() <= 1 {
         return rule.to_string();
@@ -79,10 +79,11 @@ fn home_rule_paths(rule: &str, home: &str) -> String {
     out
 }
 
-/// Claude Code matches a `Bash(...)` rule against the command text as typed and does not
-/// expand `~` inside it, so a home path in it must stay exactly as written: no `~` rewrite of
-/// any kind. A secret-shaped value is still dropped, with the warning `Ctx::scrub` gives.
-fn scrub_bash_rule(ctx: &Ctx, rule: &str) -> Doc {
+/// The secret check of `Ctx::scrub` without its `~` rewrite: a secret-shaped rule becomes
+/// `<redacted>` with the same warning, anything else is kept exactly as written. An import must
+/// never change what a permission rule means, and Claude Code reads a single-slash path as
+/// relative to the settings folder, so turning a home path into `~/` would change it.
+fn scrub_rule_secrets(ctx: &Ctx, rule: &str) -> Doc {
     match find_secrets(rule).first() {
         Some(hit) => {
             ctx.warn(format!("dropped a secret-looking value ({})", hit.id));
@@ -180,17 +181,21 @@ impl Importer for ClaudeSettings {
         if let Some(mode) = truthy(perms.get("defaultMode")) {
             permissions.insert("default_mode".into(), mode.clone());
         }
-        // All three lists are scrubbed. The reference scrubs only `allow`; scrubbing `deny`
-        // and `ask` too keeps home paths and secret-shaped values out of the manifest. Rules in
-        // Claude Code's `//<home>` form are rewritten to `~` first so they keep their meaning,
-        // and `Bash(...)` rules keep their home paths as written (only secrets are dropped).
+        // A permission rule must mean the same after import. Every rule keeps its text, home
+        // paths included, except that a secret-shaped rule becomes `<redacted>` and, outside
+        // `Bash(...)` rules (matched against the command as typed), Claude Code's `//<home>`
+        // form becomes `~`. The reference instead ran `allow` through the full scrub and left
+        // `deny` and `ask` alone. A non-string entry, which Claude Code rejects, gets the full
+        // scrub.
         let home = ctx.home().to_string_lossy().to_string();
         for key in ["allow", "deny", "ask"] {
             let list: Vec<Doc> = uniq(&[perms.get(key), local_perms.get(key)])
                 .iter()
                 .map(|x| match x {
-                    Value::String(rule) if rule.starts_with("Bash(") => scrub_bash_rule(ctx, rule),
-                    Value::String(rule) => ctx.scrub(&Value::String(home_rule_paths(rule, &home))),
+                    Value::String(rule) if rule.starts_with("Bash(") => {
+                        scrub_rule_secrets(ctx, rule)
+                    }
+                    Value::String(rule) => scrub_rule_secrets(ctx, &home_rule_paths(rule, &home)),
                     other => ctx.scrub(other),
                 })
                 .collect();
@@ -233,7 +238,7 @@ mod tests {
       "effortLevel": "high",
       "env": { "EXAMPLE_API_KEY": "@TOKEN@", "DEBUG_LEVEL": "1" },
       "permissions": {
-        "allow": ["Bash(ls)", "Read(@HOME@/notes/*)"],
+        "allow": ["Bash(ls)", "Read(/@HOME@/notes/*)"],
         "deny": ["mcp__work__*"],
         "ask": ["Bash(git push:*)"],
         "defaultMode": "acceptEdits"
@@ -337,9 +342,9 @@ mod tests {
             ".claude/settings.json",
             r#"{
               "permissions": {
-                "allow": ["Read(@HOME@/notes/*)", "Bash(curl -H @TOKEN@)"],
-                "deny": ["Read(@HOME@/private/**)", "Bash(echo @TOKEN@)"],
-                "ask": ["Edit(@HOME@/notes/todo.md)", "WebFetch(@TOKEN@)"]
+                "allow": ["Read(/@HOME@/notes/*)", "Bash(curl -H @TOKEN@)"],
+                "deny": ["Read(/@HOME@/private/**)", "Bash(echo @TOKEN@)"],
+                "ask": ["Edit(/@HOME@/notes/todo.md)", "WebFetch(@TOKEN@)"]
               },
               "hooks": {
                 "Stop": [{ "hooks": [
@@ -430,6 +435,35 @@ mod tests {
         );
         // a secret-shaped Bash rule is still dropped, with the usual warning
         assert_eq!(ctx.warnings(), [DROPPED]);
+    }
+
+    #[test]
+    fn settings_single_slash_home_paths_stay_as_written() {
+        let h = home();
+        // `@HOME@` is the absolute home, so these are single-slash absolute paths, which Claude
+        // Code reads as relative to the settings folder; rewriting them would change the rule.
+        h.write(
+            ".claude/settings.json",
+            r#"{
+              "permissions": {
+                "allow": ["Read(@HOME@/notes/*)", "Edit(@HOME@/x)"],
+                "deny": ["Read(@HOME@/notes/*)", "Edit(@HOME@/x)"],
+                "ask": ["Write(@HOME@/notes/draft.md)"]
+              }
+            }"#,
+        );
+        let ctx = h.ctx();
+        let f = ClaudeSettings.run(&ctx, &json!({})).unwrap();
+        let home = h.s();
+        assert_eq!(
+            f["tools"]["permissions"],
+            json!({
+                "allow": [format!("Read({home}/notes/*)"), format!("Edit({home}/x)")],
+                "deny": [format!("Read({home}/notes/*)"), format!("Edit({home}/x)")],
+                "ask": [format!("Write({home}/notes/draft.md)")]
+            })
+        );
+        assert!(ctx.warnings().is_empty());
     }
 
     #[test]
