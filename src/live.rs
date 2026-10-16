@@ -5,8 +5,10 @@
 //! Contract (spec section "`apply --live`"):
 //! - `~/.claude/settings.json`: `permissions.allow|deny|ask`, `permissions.defaultMode`,
 //!   `deniedMcpServers`, `hooks`, `enabledPlugins`, `model` and `effortLevel` come from
-//!   setup.yaml. Every other key stays as found, and `env` is never written at all: setup.yaml
-//!   holds env names, not values, so the names that still need a value go in the report.
+//!   setup.yaml. A managed key whose setup.yaml section is absent (or whose scalar is unset)
+//!   keeps its live value; a present section, even an empty one, replaces it. Every other key
+//!   stays as found, and `env` is never written at all: setup.yaml holds env names, not values,
+//!   so the names that still need a value go in the report.
 //! - `~/.claude.json`: user-scope `mcpServers` the file lacks are added (the file is created as
 //!   `{"mcpServers":{}}` when absent). An existing server keeps its `env` and `headers` always,
 //!   and its `command`, `args`, `url`, `type` unless `force`. Disabled and denied servers and
@@ -15,12 +17,18 @@
 //!   written when missing or with `force`. `launchctl` is never run.
 //! - `~/.claude/setup-as-code/{RULES.md,setup.lock.json,report.md}`: regenerated every run.
 //! - A malformed existing settings.json or .claude.json stops the run before any backup or write.
+//! - Containment: every path the run may write, and the backup directory, is resolved through
+//!   symlinks first, and the run is refused when one lands outside the home. For a home that is
+//!   not the real one, it is also refused when one lands in the real home (a sandbox that itself
+//!   lives in the real home may write inside itself, never into the real home's protected
+//!   config). Symlinks that stay inside the home keep working.
 //! - Writes are atomic (temp file + rename) and go through a symlinked file to its target.
 
 use crate::apply::{
-    claude_settings_doc, instance_name, lock_doc, mcp_entry, mcp_excluded, plist_loops, plist_xml,
-    pretty_json, rules_md,
+    absolute_home, claude_settings_doc, instance_name, lock_doc, mcp_entry, mcp_excluded,
+    plist_loops, plist_xml, pretty_json, protected_hit, resolve, rules_md,
 };
+use crate::ctx::real_home;
 use crate::util::{arr, get_path, now_iso, str_list};
 use crate::Doc;
 use anyhow::{anyhow, bail, Context, Result};
@@ -106,25 +114,47 @@ impl Target {
 }
 
 pub fn apply_live(desired: &Doc, opts: &LiveOptions) -> Result<LiveReport> {
+    apply_live_in(desired, opts, &real_home())
+}
+
+/// `apply_live` with the real home passed in, so tests can stand a temp directory in for it.
+pub(crate) fn apply_live_in(desired: &Doc, opts: &LiveOptions, real: &Path) -> Result<LiveReport> {
     if !opts.yes {
         bail!(
             "apply --live writes into {} and needs --yes",
             opts.home.display()
         );
     }
-    let home = if opts.home.is_absolute() {
-        opts.home.clone()
-    } else {
-        std::env::current_dir()?.join(&opts.home)
-    };
-    if !home.is_dir() {
-        bail!("apply --live: home {} is not a directory", home.display());
+    if !opts.home.is_dir() {
+        bail!(
+            "apply --live: home {} is not a directory",
+            opts.home.display()
+        );
     }
+    let home = absolute_home(&opts.home)?;
     let home = home.as_path();
     let name = instance_name(desired)?;
     let loops = plist_loops(desired)?;
+    let plist_rel = |label: &str, enabled: bool| {
+        if enabled {
+            format!("{AGENTS}/{label}.plist")
+        } else {
+            format!("{AGENTS}/disabled/{label}.plist")
+        }
+    };
 
-    // Every read and check happens before the first backup or write.
+    // Every check and read happens before the first backup or write.
+    let mut reach: Vec<String> = [SETTINGS, CLAUDE_JSON, BACKUPS]
+        .into_iter()
+        .map(String::from)
+        .collect();
+    reach.extend(loops.iter().map(|(_, label, on)| plist_rel(label, *on)));
+    reach.extend(
+        ["RULES.md", "setup.lock.json", "report.md"]
+            .into_iter()
+            .map(|f| format!("{STATE}/{f}")),
+    );
+    check_containment(home, real, &reach)?;
     let settings = read_object(home, SETTINGS)?;
     if settings
         .as_ref()
@@ -156,6 +186,7 @@ pub fn apply_live(desired: &Doc, opts: &LiveOptions) -> Result<LiveReport> {
     let merged = merge_settings(
         settings.clone().unwrap_or_default(),
         &claude_settings_doc(desired),
+        desired,
     );
     let mut t = Target::new(SETTINGS, pretty_json(&Value::Object(merged.clone())));
     t.same_as_existing = settings == Some(merged);
@@ -172,12 +203,7 @@ pub fn apply_live(desired: &Doc, opts: &LiveOptions) -> Result<LiveReport> {
     t.fill_in = added;
     targets.push(t);
     for (l, label, enabled) in &loops {
-        let rel = if *enabled {
-            format!("{AGENTS}/{label}.plist")
-        } else {
-            format!("{AGENTS}/disabled/{label}.plist")
-        };
-        let mut t = Target::new(rel, plist_xml(l, home));
+        let mut t = Target::new(plist_rel(label, *enabled), plist_xml(l, home));
         t.force_only = true;
         t.launch = *enabled;
         t.fill_in = str_list(l.get("env_names"));
@@ -279,27 +305,94 @@ fn read_object(home: &Path, rel: &str) -> Result<Option<Map<String, Value>>> {
     }
 }
 
-/// The rendered settings' managed keys over the existing file. `model`, `effortLevel` and
-/// `defaultMode` keep their current value when setup.yaml does not set them.
-fn merge_settings(mut cur: Map<String, Value>, want: &Doc) -> Map<String, Value> {
+/// Refuse the run when a path it may write resolves, through symlinks, outside the home; or,
+/// for a home that is not the real one, into the real home. A sandbox that itself lives in the
+/// real home may write inside itself, but never into the real home's protected config. A
+/// dangling symlink on the way is refused too, since its target cannot be checked.
+fn check_containment(home: &Path, real: &Path, rels: &[String]) -> Result<()> {
+    let real = absolute_home(real)?;
+    let sandbox = real != home;
+    let nested = home.starts_with(&real);
+    for rel in rels {
+        let mut on_the_way = home.to_path_buf();
+        for part in Path::new(rel).components() {
+            on_the_way.push(part);
+            let is_link = std::fs::symlink_metadata(&on_the_way)
+                .map(|m| m.file_type().is_symlink())
+                .unwrap_or(false);
+            if is_link && std::fs::canonicalize(&on_the_way).is_err() {
+                bail!(
+                    "refusing: {} is a dangling symlink; nothing was backed up or written",
+                    on_the_way.display()
+                );
+            }
+        }
+        let p = resolve(&home.join(rel));
+        if !p.starts_with(home) {
+            bail!(
+                "refusing: ~/{rel} resolves to {}, outside the home {}; nothing was backed up or written",
+                p.display(),
+                home.display()
+            );
+        }
+        if sandbox && p.starts_with(&real) && !nested {
+            bail!(
+                "refusing: ~/{rel} resolves to {}, inside the real home; nothing was backed up or written",
+                p.display()
+            );
+        }
+        if sandbox {
+            if let Some(prot) = protected_hit(&p, &real) {
+                bail!(
+                    "refusing: ~/{rel} resolves into the real home's protected path {prot}; nothing was backed up or written"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The rendered settings' managed keys over the existing file. A key whose setup.yaml section
+/// is absent keeps its live value, as does an unset `model`, `effortLevel` or `defaultMode`; a
+/// present section replaces it, even when empty.
+fn merge_settings(mut cur: Map<String, Value>, want: &Doc, desired: &Doc) -> Map<String, Value> {
+    let declared = |path: &str| get_path(desired, path).is_some();
     for k in ["model", "effortLevel"] {
         if let Some(v) = want.get(k) {
             cur.insert(k.to_string(), v.clone());
         }
     }
-    let perms = cur
-        .entry("permissions")
-        .or_insert_with(|| Value::Object(Map::new()));
-    if let (Some(p), Some(w)) = (perms.as_object_mut(), want.get("permissions")) {
-        for k in ["defaultMode", "allow", "deny", "ask"] {
-            if let Some(v) = w.get(k) {
+    let wp = want.get("permissions");
+    let mut perms: Vec<(&str, &Value)> = Vec::new();
+    if let Some(v) = wp.and_then(|w| w.get("defaultMode")) {
+        perms.push(("defaultMode", v));
+    }
+    for k in ["allow", "deny", "ask"] {
+        if declared(&format!("tools.permissions.{k}")) {
+            if let Some(v) = wp.and_then(|w| w.get(k)) {
+                perms.push((k, v));
+            }
+        }
+    }
+    if !perms.is_empty() {
+        let p = cur
+            .entry("permissions")
+            .or_insert_with(|| Value::Object(Map::new()));
+        if let Some(p) = p.as_object_mut() {
+            for (k, v) in perms {
                 p.insert(k.to_string(), v.clone());
             }
         }
     }
-    for k in ["deniedMcpServers", "hooks", "enabledPlugins"] {
-        if let Some(v) = want.get(k) {
-            cur.insert(k.to_string(), v.clone());
+    for (k, section) in [
+        ("deniedMcpServers", "tools.denied_mcp_servers"),
+        ("hooks", "tools.hooks"),
+        ("enabledPlugins", "tools.plugins"),
+    ] {
+        if declared(section) {
+            if let Some(v) = want.get(k) {
+                cur.insert(k.to_string(), v.clone());
+            }
         }
     }
     cur
@@ -711,6 +804,17 @@ mod tests {
         home.join("Library/LaunchAgents")
     }
 
+    /// `apply_live` with a stand-in real home next to the given one, so no test looks at the
+    /// owner's home.
+    fn live(d: &Doc, o: &LiveOptions) -> Result<LiveReport> {
+        let real = o.home.parent().unwrap().join("stand-in-real-home");
+        apply_live_in(d, o, &real)
+    }
+
+    fn canon(p: &Path) -> PathBuf {
+        p.canonicalize().unwrap()
+    }
+
     #[test]
     fn live_refuses_without_yes() {
         let home = tempfile::tempdir().unwrap();
@@ -726,9 +830,9 @@ mod tests {
     #[test]
     fn live_into_empty_home_creates_files_and_no_backup() {
         let tmp = tempfile::tempdir().unwrap();
-        let home = tmp.path();
+        let home = &canon(tmp.path());
         let d = fixture();
-        let r = apply_live(&d, &opts(home, true, false)).unwrap();
+        let r = live(&d, &opts(home, true, false)).unwrap();
 
         let settings = read_json(&home.join(".claude/settings.json"));
         assert_eq!(settings["model"], json!("opus"));
@@ -817,7 +921,7 @@ mod tests {
     #[test]
     fn live_merge_keeps_env_and_unmanaged_keys_and_replaces_allow() {
         let tmp = tempfile::tempdir().unwrap();
-        let home = tmp.path();
+        let home = &canon(tmp.path());
         std::fs::create_dir_all(home.join(".claude")).unwrap();
         let before = r#"{
   "env": { "X": "secret" },
@@ -827,7 +931,7 @@ mod tests {
   "hooks": { "Stop": [ { "hooks": [ { "type": "command", "command": "old.sh" } ] } ] }
 }"#;
         std::fs::write(home.join(".claude/settings.json"), before).unwrap();
-        let r = apply_live(&fixture(), &opts(home, true, false)).unwrap();
+        let r = live(&fixture(), &opts(home, true, false)).unwrap();
 
         let s = read_json(&home.join(".claude/settings.json"));
         assert_eq!(s["env"], json!({ "X": "secret" }));
@@ -865,7 +969,7 @@ mod tests {
     #[test]
     fn live_existing_mcp_server_keeps_env_and_command_unless_forced() {
         let tmp = tempfile::tempdir().unwrap();
-        let home = tmp.path();
+        let home = &canon(tmp.path());
         let before = r#"{
   "numStartups": 3,
   "mcpServers": {
@@ -875,7 +979,7 @@ mod tests {
 }"#;
         std::fs::write(home.join(".claude.json"), before).unwrap();
 
-        let r = apply_live(&fixture(), &opts(home, true, false)).unwrap();
+        let r = live(&fixture(), &opts(home, true, false)).unwrap();
         let cj = read_json(&home.join(".claude.json"));
         assert_eq!(cj["numStartups"], json!(3));
         assert_eq!(cj["projects"], json!({}));
@@ -896,7 +1000,7 @@ mod tests {
         assert_eq!(read(&first_backup.join(".claude.json")), before);
 
         let between = read(&home.join(".claude.json"));
-        let r = apply_live(&fixture(), &opts(home, true, true)).unwrap();
+        let r = live(&fixture(), &opts(home, true, true)).unwrap();
         let cj = read_json(&home.join(".claude.json"));
         assert_eq!(
             cj["mcpServers"]["files"],
@@ -911,10 +1015,10 @@ mod tests {
     #[test]
     fn live_refuses_malformed_settings_json() {
         let tmp = tempfile::tempdir().unwrap();
-        let home = tmp.path();
+        let home = &canon(tmp.path());
         std::fs::create_dir_all(home.join(".claude")).unwrap();
         std::fs::write(home.join(".claude/settings.json"), "{ not json").unwrap();
-        let err = err_of(apply_live(&fixture(), &opts(home, true, true)));
+        let err = err_of(live(&fixture(), &opts(home, true, true)));
         assert!(
             err.contains("~/.claude/settings.json is not valid JSON"),
             "{err}"
@@ -929,15 +1033,15 @@ mod tests {
     #[test]
     fn live_refuses_malformed_claude_json() {
         let tmp = tempfile::tempdir().unwrap();
-        let home = tmp.path();
+        let home = &canon(tmp.path());
         std::fs::write(home.join(".claude.json"), "[1, 2").unwrap();
-        let err = err_of(apply_live(&fixture(), &opts(home, true, false)));
+        let err = err_of(live(&fixture(), &opts(home, true, false)));
         assert!(err.contains("~/.claude.json is not valid JSON"), "{err}");
         assert_eq!(read(&home.join(".claude.json")), "[1, 2");
         assert_eq!(entries(home), 1, "no backup and no other write");
 
         std::fs::write(home.join(".claude.json"), r#"{ "mcpServers": [] }"#).unwrap();
-        let err = err_of(apply_live(&fixture(), &opts(home, true, false)));
+        let err = err_of(live(&fixture(), &opts(home, true, false)));
         assert!(err.contains("mcpServers"), "{err}");
         assert_eq!(entries(home), 1);
     }
@@ -945,9 +1049,9 @@ mod tests {
     #[test]
     fn live_writes_disabled_loop_plist_under_disabled_dir() {
         let tmp = tempfile::tempdir().unwrap();
-        let home = tmp.path();
+        let home = &canon(tmp.path());
         let d = fixture();
-        let r = apply_live(&d, &opts(home, true, false)).unwrap();
+        let r = live(&d, &opts(home, true, false)).unwrap();
         let disabled = agents(home).join("disabled/com.example.sweep.plist");
         assert_eq!(read(&disabled), plist_xml(&d["loops"][1], home));
         assert!(!agents(home).join("com.example.sweep.plist").exists());
@@ -960,12 +1064,12 @@ mod tests {
     #[test]
     fn live_keeps_an_existing_plist_unless_forced() {
         let tmp = tempfile::tempdir().unwrap();
-        let home = tmp.path();
+        let home = &canon(tmp.path());
         std::fs::create_dir_all(agents(home)).unwrap();
         let morning = agents(home).join("com.example.morning.plist");
         std::fs::write(&morning, "old plist").unwrap();
 
-        let r = apply_live(&fixture(), &opts(home, true, false)).unwrap();
+        let r = live(&fixture(), &opts(home, true, false)).unwrap();
         assert_eq!(read(&morning), "old plist");
         assert!(r.commands.is_empty(), "{:?}", r.commands);
         assert!(r
@@ -974,7 +1078,7 @@ mod tests {
             .any(|s| s.starts_with("~/Library/LaunchAgents/com.example.morning.plist")));
         assert!(r.backup_dir.is_none(), "nothing that existed changed");
 
-        let r = apply_live(&fixture(), &opts(home, true, true)).unwrap();
+        let r = live(&fixture(), &opts(home, true, true)).unwrap();
         assert_eq!(read(&morning), plist_xml(&fixture()["loops"][0], home));
         assert_eq!(r.commands.len(), 1);
         let backup = r.backup_dir.unwrap();
@@ -987,9 +1091,9 @@ mod tests {
     #[test]
     fn live_second_run_backs_up_only_what_changes() {
         let tmp = tempfile::tempdir().unwrap();
-        let home = tmp.path();
-        apply_live(&fixture(), &opts(home, true, false)).unwrap();
-        let r = apply_live(&fixture(), &opts(home, true, false)).unwrap();
+        let home = &canon(tmp.path());
+        live(&fixture(), &opts(home, true, false)).unwrap();
+        let r = live(&fixture(), &opts(home, true, false)).unwrap();
         for unchanged in ["~/.claude/settings.json", "~/.claude.json"] {
             assert!(!r.changed.iter().any(|c| c == unchanged), "{unchanged}");
             assert!(r.skipped.iter().any(|s| s.starts_with(unchanged)));
@@ -1005,9 +1109,9 @@ mod tests {
     #[test]
     fn live_writes_the_state_files_every_run() {
         let tmp = tempfile::tempdir().unwrap();
-        let home = tmp.path();
-        apply_live(&fixture(), &opts(home, true, false)).unwrap();
-        let r = apply_live(&fixture(), &opts(home, true, false)).unwrap();
+        let home = &canon(tmp.path());
+        live(&fixture(), &opts(home, true, false)).unwrap();
+        let r = live(&fixture(), &opts(home, true, false)).unwrap();
         for f in ["RULES.md", "setup.lock.json", "report.md"] {
             let p = format!("~/.claude/setup-as-code/{f}");
             assert!(r.changed.contains(&p), "{p} not in {:?}", r.changed);
@@ -1020,12 +1124,12 @@ mod tests {
     #[test]
     fn live_leaves_an_equivalent_json_file_alone() {
         let tmp = tempfile::tempdir().unwrap();
-        let home = tmp.path();
-        apply_live(&fixture(), &opts(home, true, false)).unwrap();
+        let home = &canon(tmp.path());
+        live(&fixture(), &opts(home, true, false)).unwrap();
         let path = home.join(".claude/settings.json");
         let compact = serde_json::to_string(&read_json(&path)).unwrap();
         std::fs::write(&path, &compact).unwrap();
-        let r = apply_live(&fixture(), &opts(home, true, false)).unwrap();
+        let r = live(&fixture(), &opts(home, true, false)).unwrap();
         assert_eq!(read(&path), compact, "same JSON must not be reformatted");
         assert!(r
             .skipped
@@ -1037,7 +1141,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut d = fixture();
         d["loops"][0]["id"] = json!("../../.ssh/evil");
-        let err = err_of(apply_live(&d, &opts(tmp.path(), true, false)));
+        let err = err_of(live(&d, &opts(tmp.path(), true, false)));
         assert!(err.contains("not a plain file name"), "{err}");
         assert_eq!(entries(tmp.path()), 0);
     }
@@ -1045,7 +1149,7 @@ mod tests {
     #[test]
     fn live_leaves_project_scoped_and_shapeless_servers_out_of_the_user_scope() {
         let tmp = tempfile::tempdir().unwrap();
-        let home = tmp.path();
+        let home = &canon(tmp.path());
         let mut d = fixture();
         d["tools"]["mcp_servers"]
             .as_array_mut()
@@ -1054,7 +1158,7 @@ mod tests {
                 json!({ "id": "proj", "source": "~/.claude.json#projects/~/work", "transport": "stdio", "command": "proj-server" }),
                 json!({ "id": "linked", "transport": "connector" }),
             ]);
-        let r = apply_live(&d, &opts(home, true, false)).unwrap();
+        let r = live(&d, &opts(home, true, false)).unwrap();
         let servers = read_json(&home.join(".claude.json"))["mcpServers"].clone();
         assert!(servers.get("proj").is_none());
         assert!(servers.get("linked").is_none());
@@ -1066,7 +1170,7 @@ mod tests {
     #[test]
     fn live_never_lets_an_at_suffixed_duplicate_touch_its_namesake() {
         let tmp = tempfile::tempdir().unwrap();
-        let home = tmp.path();
+        let home = &canon(tmp.path());
         let d = json!({
             "version": 1,
             "meta": { "instance": "alex" },
@@ -1076,7 +1180,7 @@ mod tests {
             ]}
         });
         for force in [false, true] {
-            let r = apply_live(&d, &opts(home, true, force)).unwrap();
+            let r = live(&d, &opts(home, true, force)).unwrap();
             let servers = read_json(&home.join(".claude.json"))["mcpServers"].clone();
             assert_eq!(servers, mcp_servers_doc(&d)["mcpServers"], "force={force}");
             assert_eq!(
@@ -1093,17 +1197,22 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn live_writes_through_a_symlinked_settings_file() {
+    fn live_follows_symlinks_that_stay_inside_the_home() {
+        use std::os::unix::fs::symlink;
         let tmp = tempfile::tempdir().unwrap();
-        let home = tmp.path().join("home");
-        let dotfiles = tmp.path().join("dotfiles");
+        let home = &canon(tmp.path()).join("home");
+        // A dotfiles checkout inside the home: ~/.claude/settings.json is a link into it, and
+        // so is the whole ~/Library/LaunchAgents directory.
+        let dotfiles = home.join("dotfiles");
         std::fs::create_dir_all(home.join(".claude")).unwrap();
-        std::fs::create_dir_all(&dotfiles).unwrap();
+        std::fs::create_dir_all(dotfiles.join("agents")).unwrap();
+        std::fs::create_dir_all(home.join("Library")).unwrap();
         std::fs::write(dotfiles.join("settings.json"), r#"{ "theme": "dark" }"#).unwrap();
         let link = home.join(".claude/settings.json");
-        std::os::unix::fs::symlink(dotfiles.join("settings.json"), &link).unwrap();
+        symlink(dotfiles.join("settings.json"), &link).unwrap();
+        symlink(dotfiles.join("agents"), agents(home)).unwrap();
 
-        let r = apply_live(&fixture(), &opts(&home, true, false)).unwrap();
+        let r = live(&fixture(), &opts(home, true, false)).unwrap();
         assert!(std::fs::symlink_metadata(&link)
             .unwrap()
             .file_type()
@@ -1111,6 +1220,10 @@ mod tests {
         let s = read_json(&dotfiles.join("settings.json"));
         assert_eq!(s["theme"], json!("dark"));
         assert_eq!(s["model"], json!("opus"));
+        assert!(dotfiles.join("agents/com.example.morning.plist").is_file());
+        assert!(dotfiles
+            .join("agents/disabled/com.example.sweep.plist")
+            .is_file());
         let backup = r.backup_dir.unwrap();
         assert_eq!(
             read(&backup.join(".claude/settings.json")),
@@ -1118,16 +1231,163 @@ mod tests {
         );
     }
 
+    /// Run against a home holding one planted symlink that leads outside it; the run must be
+    /// refused with nothing written, inside the home or out.
+    #[cfg(unix)]
+    fn assert_refused_with_link(at: &str, outside_is_dir: bool) {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = canon(tmp.path());
+        let home = root.join("home");
+        let outside = root.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        let target = if outside_is_dir {
+            outside.clone()
+        } else {
+            std::fs::write(outside.join("file.json"), r#"{ "theme": "dark" }"#).unwrap();
+            outside.join("file.json")
+        };
+        let link = home.join(at);
+        std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let before = files_below(&home);
+
+        let err = err_of(live(&fixture(), &opts(&home, true, true)));
+        assert!(err.contains("outside the home"), "{at}: {err}");
+        assert_eq!(files_below(&home), before, "{at}: the home changed");
+        for created in [".claude.json", ".setup-as-code"] {
+            if at != created {
+                let absent = std::fs::symlink_metadata(home.join(created)).is_err();
+                assert!(absent, "{at}: {created} was created");
+            }
+        }
+        let left: Vec<String> = files_below(&outside);
+        let expected: Vec<String> = if outside_is_dir {
+            Vec::new()
+        } else {
+            vec!["file.json".to_string()]
+        };
+        assert_eq!(left, expected, "{at}: something was written outside");
+        if !outside_is_dir {
+            assert_eq!(read(&target), r#"{ "theme": "dark" }"#);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn live_refuses_a_claude_dir_symlinked_outside_the_home() {
+        assert_refused_with_link(".claude", true);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn live_refuses_files_and_dirs_symlinked_outside_the_home() {
+        assert_refused_with_link(".claude/settings.json", false);
+        assert_refused_with_link(".claude.json", false);
+        assert_refused_with_link("Library", true);
+        assert_refused_with_link(".claude/setup-as-code", true);
+        assert_refused_with_link(".setup-as-code", true);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn live_refuses_a_dangling_symlink_on_the_way() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = &canon(tmp.path()).join("home");
+        std::fs::create_dir_all(home).unwrap();
+        std::os::unix::fs::symlink(home.join("missing"), home.join(".claude")).unwrap();
+        let err = err_of(live(&fixture(), &opts(home, true, false)));
+        assert!(err.contains("dangling symlink"), "{err}");
+        assert_eq!(entries(home), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn live_keeps_a_sandbox_out_of_the_real_home() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = canon(tmp.path());
+
+        // The given home contains the real one, and a link inside it leads there.
+        let outer = root.join("outer");
+        let real = outer.join("me");
+        std::fs::create_dir_all(real.join(".claude")).unwrap();
+        std::os::unix::fs::symlink(real.join(".claude"), outer.join(".claude")).unwrap();
+        let err = err_of(apply_live_in(&fixture(), &opts(&outer, true, false), &real));
+        assert!(err.contains("inside the real home"), "{err}");
+        assert_eq!(entries(&real.join(".claude")), 0);
+        assert!(!outer.join(".claude.json").exists());
+
+        // A sandbox that lives inside the real home may write inside itself...
+        let real = root.join("me2");
+        let sandbox = real.join("sandbox");
+        std::fs::create_dir_all(&sandbox).unwrap();
+        let r = apply_live_in(&fixture(), &opts(&sandbox, true, false), &real).unwrap();
+        assert!(sandbox.join(".claude/settings.json").is_file());
+        assert_eq!(entries(&real), 1, "only the sandbox itself");
+        assert_eq!(r.changed.len(), 7);
+
+        // ...but never into the real home's protected config.
+        let real = root.join("me3");
+        let sandbox = real.join(".claude/sandbox");
+        std::fs::create_dir_all(&sandbox).unwrap();
+        let err = err_of(apply_live_in(
+            &fixture(),
+            &opts(&sandbox, true, false),
+            &real,
+        ));
+        assert!(
+            err.contains("real home's protected path ~/.claude"),
+            "{err}"
+        );
+        assert_eq!(entries(&sandbox), 0);
+    }
+
+    #[test]
+    fn live_absent_manifest_sections_leave_live_keys_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = &canon(tmp.path());
+        std::fs::create_dir_all(home.join(".claude")).unwrap();
+        let before = r#"{
+  "model": "sonnet",
+  "permissions": { "defaultMode": "plan", "allow": ["Bash(ls*)"], "deny": ["Bash(rm -rf*)"] },
+  "deniedMcpServers": [{ "serverName": "bad" }],
+  "hooks": { "Stop": [{ "hooks": [{ "type": "command", "command": "done.sh" }] }] },
+  "enabledPlugins": { "helper@example": true }
+}"#;
+        let path = home.join(".claude/settings.json");
+        std::fs::write(&path, before).unwrap();
+
+        // No `tools` (and no `brain`) at all: every managed key keeps its live value.
+        let bare = json!({ "version": 1, "meta": { "instance": "alex" } });
+        let r = live(&bare, &opts(home, true, false)).unwrap();
+        assert_eq!(read(&path), before);
+        assert!(r
+            .skipped
+            .contains(&"~/.claude/settings.json (unchanged)".to_string()));
+
+        // A present section replaces its key, even when empty; absent ones still stay.
+        let some = json!({ "version": 1, "meta": { "instance": "alex" },
+                           "tools": { "hooks": [], "permissions": { "allow": ["Read"] } } });
+        live(&some, &opts(home, true, false)).unwrap();
+        let s = read_json(&path);
+        assert_eq!(s["hooks"], json!({}));
+        assert_eq!(s["permissions"]["allow"], json!(["Read"]));
+        assert_eq!(s["permissions"]["deny"], json!(["Bash(rm -rf*)"]));
+        assert_eq!(s["permissions"]["defaultMode"], json!("plan"));
+        assert_eq!(s["deniedMcpServers"], json!([{ "serverName": "bad" }]));
+        assert_eq!(s["enabledPlugins"], json!({ "helper@example": true }));
+        assert_eq!(s["model"], json!("sonnet"));
+    }
+
     #[cfg(unix)]
     #[test]
     fn live_new_claude_json_is_private_and_backups_are_closed() {
         use std::os::unix::fs::PermissionsExt;
         let tmp = tempfile::tempdir().unwrap();
-        let home = tmp.path();
-        apply_live(&fixture(), &opts(home, true, false)).unwrap();
+        let home = &canon(tmp.path());
+        live(&fixture(), &opts(home, true, false)).unwrap();
         let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode(&home.join(".claude.json")), 0o600);
-        let r = apply_live(&fixture(), &opts(home, true, false)).unwrap();
+        let r = live(&fixture(), &opts(home, true, false)).unwrap();
         assert_eq!(mode(&r.backup_dir.unwrap()), 0o700);
     }
 }

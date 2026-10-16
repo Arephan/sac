@@ -45,28 +45,70 @@ const PROTECTED: [&str; 8] = [
 /// The check runs twice: once before anything is created, on the path as it would resolve
 /// (so a refused root is never made), and once on the canonical path afterwards (so a symlink
 /// cannot carry the root into a protected place). Protected paths are compared both as written
-/// and as they resolve, which also catches `/etc` being `/private/etc` on macOS.
+/// and as they resolve, which also catches `/etc` being `/private/etc` on macOS. A relative
+/// `home` is made absolute first.
 pub fn assert_safe_out_root(out_root: &Path, home: &Path) -> Result<PathBuf> {
-    let abs = if out_root.is_absolute() {
-        out_root.to_path_buf()
-    } else {
-        std::env::current_dir()?.join(out_root)
-    };
-    refuse_protected(&resolve(&abs), home)?;
+    let home = absolute_home(home)?;
+    let abs = absolute(out_root)?;
+    refuse_protected(&resolve(&abs), &home, "out/")?;
     std::fs::create_dir_all(&abs).with_context(|| format!("create {}", abs.display()))?;
     let real = std::fs::canonicalize(&abs).with_context(|| format!("resolve {}", abs.display()))?;
-    refuse_protected(&real, home)?;
+    refuse_protected(&real, &home, "out/")?;
     Ok(real)
 }
 
-fn refuse_protected(p: &Path, home: &Path) -> Result<()> {
-    for prot in PROTECTED {
-        let lexical = normalize(Path::new(&expand_home(prot, home)));
-        if p.starts_with(&lexical) || p.starts_with(resolve(&lexical)) {
-            bail!("refusing: out/ resolves into protected path {prot}");
+/// The out root and `<out_root>/<instance>`, both checked against the protected paths of every
+/// given home before anything is created, then created and checked again once resolved.
+/// Limitation: on a case-insensitive volume, a case variant of a protected path that does not
+/// exist yet passes the first check and is refused only by the second, after the root exists.
+fn safe_out_dir(out_root: &Path, name: &str, homes: &[PathBuf]) -> Result<(PathBuf, PathBuf)> {
+    let check = |root: &Path| -> Result<()> {
+        for home in homes {
+            refuse_protected(&resolve(root), home, "out/")?;
+            refuse_protected(&resolve(&root.join(name)), home, &format!("out/{name}"))?;
         }
+        Ok(())
+    };
+    let abs = absolute(out_root)?;
+    check(&abs)?;
+    std::fs::create_dir_all(&abs).with_context(|| format!("create {}", abs.display()))?;
+    let real = std::fs::canonicalize(&abs).with_context(|| format!("resolve {}", abs.display()))?;
+    check(&real)?;
+    let out_dir = real.join(name);
+    Ok((real, out_dir))
+}
+
+/// The first protected path (as written in `PROTECTED`) that holds `p`, for this home.
+pub(crate) fn protected_hit(p: &Path, home: &Path) -> Option<&'static str> {
+    PROTECTED.into_iter().find(|prot| {
+        let lexical = normalize(Path::new(&expand_home(prot, home)));
+        p.starts_with(&lexical) || p.starts_with(resolve(&lexical))
+    })
+}
+
+fn refuse_protected(p: &Path, home: &Path, what: &str) -> Result<()> {
+    match protected_hit(p, home) {
+        Some(prot) => bail!("refusing: {what} resolves into protected path {prot}"),
+        None => Ok(()),
     }
-    Ok(())
+}
+
+/// A path made absolute against the current directory.
+fn absolute(p: &Path) -> Result<PathBuf> {
+    Ok(if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(p)
+    })
+}
+
+/// A home as an absolute path: canonical when it exists, else joined onto the current
+/// directory with `.` and `..` folded.
+pub(crate) fn absolute_home(home: &Path) -> Result<PathBuf> {
+    match std::fs::canonicalize(home) {
+        Ok(real) => Ok(real),
+        Err(_) => Ok(normalize(&absolute(home)?)),
+    }
 }
 
 /// Lexical clean-up: drop `.` and fold `..` onto its parent.
@@ -85,7 +127,7 @@ fn normalize(p: &Path) -> PathBuf {
 }
 
 /// Canonicalize the longest existing ancestor of a path and re-append the rest.
-fn resolve(p: &Path) -> PathBuf {
+pub(crate) fn resolve(p: &Path) -> PathBuf {
     let p = normalize(p);
     let mut base = p.clone();
     let mut rest: Vec<OsString> = Vec::new();
@@ -104,11 +146,6 @@ fn resolve(p: &Path) -> PathBuf {
             _ => return p,
         }
     }
-}
-
-fn same_dir(a: &Path, b: &Path) -> bool {
-    let c = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| normalize(p));
-    c(a) == c(b)
 }
 
 /// A single path component that cannot climb out of, or reach past, its directory.
@@ -212,15 +249,36 @@ pub fn render(
     policy_text: Option<&str>,
     plan_text: Option<&str>,
 ) -> Result<ApplyOut> {
+    render_in(
+        desired,
+        out_root,
+        home,
+        &real_home(),
+        policy_text,
+        plan_text,
+    )
+}
+
+/// `render` with the real home passed in, so tests can stand a temp directory in for it.
+pub(crate) fn render_in(
+    desired: &Doc,
+    out_root: &Path,
+    home: &Path,
+    real: &Path,
+    policy_text: Option<&str>,
+    plan_text: Option<&str>,
+) -> Result<ApplyOut> {
     let name = instance_name(desired)?;
     let plists = plist_loops(desired)?;
-    let root = assert_safe_out_root(out_root, home)?;
-    let real = real_home();
-    if !same_dir(&real, home) {
-        // `home` may be a sandbox; the person's real config is protected as well.
-        assert_safe_out_root(&root, &real)?;
+    let home = absolute_home(home)?;
+    // `home` may be a sandbox; the person's real config is protected as well, and both are
+    // checked before anything is created.
+    let mut homes = vec![home.clone()];
+    let real = absolute_home(real)?;
+    if real != home {
+        homes.push(real);
     }
-    let out_dir = root.join(&name);
+    let (root, out_dir) = safe_out_dir(out_root, &name, &homes)?;
     let mut w = Writer {
         root: &root,
         out_dir: out_dir.clone(),
@@ -238,7 +296,7 @@ pub fn render(
     w.write("claude/RULES.md", &rules_md(desired))?;
     for (l, label, enabled) in &plists {
         let sub = if *enabled { "" } else { "disabled/" };
-        w.write(&format!("launchd/{sub}{label}.plist"), &plist_xml(l, home))?;
+        w.write(&format!("launchd/{sub}{label}.plist"), &plist_xml(l, &home))?;
     }
     let lock = lock_doc(desired, &name);
     w.write("setup.lock.json", &pretty_json(&lock))?;
@@ -867,6 +925,19 @@ pub(crate) mod tests {
         std::fs::read_to_string(p).unwrap_or_else(|e| panic!("{}: {e}", p.display()))
     }
 
+    /// `render` with a stand-in real home next to the sandbox, so the test never looks at the
+    /// owner's home.
+    fn render_t(
+        d: &Doc,
+        out_root: &Path,
+        home: &Path,
+        policy: Option<&str>,
+        plan: Option<&str>,
+    ) -> Result<ApplyOut> {
+        let real = home.parent().unwrap().join("stand-in-real-home");
+        render_in(d, out_root, home, &real, policy, plan)
+    }
+
     // Expected outputs below were produced by the reference framework/lib/apply.mjs on the
     // same fixture.
 
@@ -1124,7 +1195,7 @@ Rendered by setup-as-code on {} from setup.yaml. 3 active rules.
         }
         assert_eq!(
             read(&launchd.join("com.example.morning.plist")),
-            plist_xml(&fixture()["loops"][0], &home)
+            plist_xml(&fixture()["loops"][0], &home.canonicalize().unwrap())
         );
         assert_eq!(
             read(&r.out_dir.join("claude/settings.json")),
@@ -1163,7 +1234,7 @@ Rendered by setup-as-code on {} from setup.yaml. 3 active rules.
         let home = tmp.path().join("home");
         std::fs::create_dir_all(&home).unwrap();
         let out = tmp.path().join("out");
-        let r = render(
+        let r = render_t(
             &fixture(),
             &out,
             &home,
@@ -1177,7 +1248,7 @@ Rendered by setup-as-code on {} from setup.yaml. 3 active rules.
         assert!(report.contains("\n## Files\n\n- out/alex/claude/settings.json\n- out/alex/claude/mcp-servers.json\n- out/alex/claude/RULES.md\n- out/alex/launchd/com.example.morning.plist\n- out/alex/launchd/disabled/com.example.sweep.plist\n- out/alex/setup.lock.json\n- out/alex/setup.resolved.yaml\n- out/alex/report.md\n\nlaunchd plists rendered: 2 (enabled at top level, disabled under launchd/disabled/). Install by hand if wanted.\n\n"));
         assert!(report.ends_with("## Plan at apply time\n\n```\nplan: nothing to do\n```\n\n## Policy results\n\n```\n  [PASS] hard     p1 (deny_mcp): ok\n```\n"));
 
-        let r2 = render(&fixture(), &tmp.path().join("out2"), &home, None, None).unwrap();
+        let r2 = render_t(&fixture(), &tmp.path().join("out2"), &home, None, None).unwrap();
         let report2 = read(&r2.out_dir.join("report.md"));
         assert!(!report2.contains("## Plan") && !report2.contains("## Policy"));
         assert!(report2.ends_with("Install by hand if wanted.\n"));
@@ -1189,7 +1260,7 @@ Rendered by setup-as-code on {} from setup.yaml. 3 active rules.
         let home = tmp.path().join("home");
         std::fs::create_dir_all(&home).unwrap();
         let d = fixture();
-        let r = render(&d, &tmp.path().join("out"), &home, None, None).unwrap();
+        let r = render_t(&d, &tmp.path().join("out"), &home, None, None).unwrap();
         let expected: String = Sha256::digest(stable_string(&d).as_bytes())
             .iter()
             .map(|b| format!("{b:02x}"))
@@ -1230,7 +1301,7 @@ Rendered by setup-as-code on {} from setup.yaml. 3 active rules.
             .to_string();
         assert!(err.contains("~/Library/LaunchAgents"), "{err}");
         assert!(!home.join("Library").exists());
-        assert!(render(&fixture(), &bad, &home, None, None).is_err());
+        assert!(render_t(&fixture(), &bad, &home, None, None).is_err());
         assert!(!bad.exists());
 
         // Component-wise: a sibling that merely shares the prefix is fine.
@@ -1266,7 +1337,7 @@ Rendered by setup-as-code on {} from setup.yaml. 3 active rules.
         let out = tmp.path().join("out");
         std::fs::create_dir_all(out.join("alex/claude")).unwrap();
         std::os::unix::fs::symlink(&victim, out.join("alex/claude/settings.json")).unwrap();
-        let err = err_of(render(&fixture(), &out, &home, None, None));
+        let err = err_of(render_t(&fixture(), &out, &home, None, None));
         assert!(err.contains("refusing to overwrite symlink"), "{err}");
         assert_eq!(read(&victim), "keep");
 
@@ -1275,7 +1346,7 @@ Rendered by setup-as-code on {} from setup.yaml. 3 active rules.
         let out2 = tmp.path().join("out2");
         std::fs::create_dir_all(out2.join("alex")).unwrap();
         std::os::unix::fs::symlink(&elsewhere, out2.join("alex/launchd")).unwrap();
-        let err = err_of(render(&fixture(), &out2, &home, None, None));
+        let err = err_of(render_t(&fixture(), &out2, &home, None, None));
         assert!(err.contains("refusing to follow symlink"), "{err}");
         assert_eq!(std::fs::read_dir(&elsewhere).unwrap().count(), 0);
     }
@@ -1288,13 +1359,132 @@ Rendered by setup-as-code on {} from setup.yaml. 3 active rules.
         let out = tmp.path().join("out");
         let mut d = fixture();
         d["loops"][0]["id"] = json!("../../escape");
-        let err = err_of(render(&d, &out, &home, None, None));
+        let err = err_of(render_t(&d, &out, &home, None, None));
         assert!(err.contains("not a plain file name"), "{err}");
         assert!(!out.exists());
         let mut d = fixture();
         d["meta"]["instance"] = json!("..");
-        assert!(render(&d, &out, &home, None, None).is_err());
-        assert!(render(&json!({ "version": 1 }), &out, &home, None, None).is_err());
+        assert!(render_t(&d, &out, &home, None, None).is_err());
+        assert!(render_t(&json!({ "version": 1 }), &out, &home, None, None).is_err());
         assert!(!out.exists());
+    }
+
+    #[test]
+    fn apply_every_protected_root_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let cases = [
+            (home.join(".claude/out"), "~/.claude"),
+            (home.join(".claude.json/out"), "~/.claude.json"),
+            (
+                home.join("Library/LaunchAgents/out"),
+                "~/Library/LaunchAgents",
+            ),
+            (
+                home.join("Library/LaunchDaemons/out"),
+                "~/Library/LaunchDaemons",
+            ),
+            (home.join(".config/systemd/out"), "~/.config/systemd"),
+            (PathBuf::from("/Library/sac-refused-out"), "/Library"),
+            (PathBuf::from("/etc/sac-refused-out"), "/etc"),
+            (PathBuf::from("/System/sac-refused-out"), "/System"),
+        ];
+        for (root, prot) in cases {
+            let err = err_of(assert_safe_out_root(&root, &home));
+            assert!(
+                err.contains(&format!("protected path {prot}")),
+                "{}: {err}",
+                root.display()
+            );
+            assert!(!root.exists(), "{} was created", root.display());
+        }
+        assert_eq!(std::fs::read_dir(&home).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn apply_out_dir_inside_a_protected_path_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(home.join(".config")).unwrap();
+        let mut d = fixture();
+        d["meta"]["instance"] = json!("systemd");
+        let err = err_of(render_t(&d, &home.join(".config"), &home, None, None));
+        assert!(
+            err.contains("out/systemd resolves into protected path ~/.config/systemd"),
+            "{err}"
+        );
+        assert!(!home.join(".config/systemd").exists());
+        // A library caller that skips validation cannot aim the instance at ~/.claude either.
+        let mut d = fixture();
+        d["meta"]["instance"] = json!(".claude");
+        let err = err_of(render_t(&d, &home, &home, None, None));
+        assert!(
+            err.contains("out/.claude resolves into protected path ~/.claude"),
+            "{err}"
+        );
+        assert!(!home.join(".claude").exists());
+    }
+
+    #[test]
+    fn apply_sandbox_render_checks_the_real_home_before_creating() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real");
+        std::fs::create_dir_all(real.join(".claude")).unwrap();
+        std::fs::create_dir_all(real.join("Library")).unwrap();
+        let sandbox = tmp.path().join("sandbox");
+        std::fs::create_dir_all(&sandbox).unwrap();
+        let bad = real.join(".claude/out");
+        let err = err_of(render_in(&fixture(), &bad, &sandbox, &real, None, None));
+        assert!(err.contains("protected path ~/.claude"), "{err}");
+        assert!(!bad.exists(), "a refused out root must not be left behind");
+        let mut d = fixture();
+        d["meta"]["instance"] = json!("LaunchAgents");
+        let err = err_of(render_in(
+            &d,
+            &real.join("Library"),
+            &sandbox,
+            &real,
+            None,
+            None,
+        ));
+        assert!(
+            err.contains("out/LaunchAgents resolves into protected path ~/Library/LaunchAgents"),
+            "{err}"
+        );
+        assert!(!real.join("Library/LaunchAgents").exists());
+        assert_eq!(std::fs::read_dir(&sandbox).unwrap().count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn apply_relative_home_is_made_absolute() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("h");
+        std::fs::create_dir_all(home.join(".claude")).unwrap();
+        // The same directory, spelled relative to the current directory.
+        let cwd = std::env::current_dir().unwrap();
+        let mut rel_home = PathBuf::new();
+        for _ in cwd.components().skip(1) {
+            rel_home.push("..");
+        }
+        rel_home.push(home.strip_prefix("/").unwrap());
+        assert!(rel_home.is_relative());
+
+        let bad = home.join(".claude/out");
+        let err = err_of(assert_safe_out_root(&bad, &rel_home));
+        assert!(err.contains("protected path ~/.claude"), "{err}");
+        assert!(!bad.exists());
+
+        let real = tmp.path().join("stand-in-real-home");
+        let out = tmp.path().join("out");
+        let r = render_in(&fixture(), &out, &rel_home, &real, None, None).unwrap();
+        let plist = read(&r.out_dir.join("launchd/com.example.morning.plist"));
+        let abs = home.canonicalize().unwrap();
+        assert!(
+            plist.contains(&format!("<string>{}/work</string>", abs.display())),
+            "{plist}"
+        );
+        assert!(!plist.contains(".."), "{plist}");
     }
 }
