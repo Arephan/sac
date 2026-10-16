@@ -6,3 +6,4 @@ target/
 .superpowers/
 .worktrees/
 docs/superpowers/
+target*/
