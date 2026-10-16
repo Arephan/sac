@@ -1,0 +1,137 @@
+# Minimal example: one person, one chat bot, one email gate, one scheduled loop, four policies.
+# Try it:  node setup.mjs validate -i examples/minimal
+#          node setup.mjs verify   -i examples/minimal --home /tmp/empty-home
+version: 1
+meta:
+  instance: minimal
+  description: Smallest useful setup - an assistant that reports in chat and drafts email.
+  owner_role: individual
+
+import:
+  importers: [claude-settings, claude-mcp, claude-skills, launchd, todo-md]
+  options:
+    launchd: { managed_prefixes: [com.example.] }
+
+identity:
+  person: { role: owner, timezone: UTC }
+  accounts:
+    - id: assistant-bot
+      kind: chat_bot
+      workspace: personal-workspace
+      credential_ref: ~/.assistant_bot_token
+      scopes: [chat:write, channels:history]
+      access: can_post
+    - id: personal-mail
+      kind: mailbox
+      principal: me@example.com
+      credential_ref: env:MAIL_APP_PASSWORD
+      scopes: [send, read]
+      access: can_post
+    - id: work-chat
+      kind: chat_user
+      workspace: employer-workspace
+      access: forbidden
+      note: work and personal never mix
+
+brain:
+  claude_code: { model: opus, effort: high }
+  runtimes:
+    - { id: headless-claude, command: claude -p }
+  gates:
+    - id: human-voice-gate
+      model: opus
+      threshold: "< 3/10"
+      applies_to: [email, social]
+
+instructions:
+  rules:
+    - id: never-spend-money
+      scope: money
+      severity: hard
+      date: 2026-01-01
+      reason: Money only moves by the owner's own click.
+      statement: No purchases, subscriptions or metered API calls by any agent or loop.
+      enforced_by: [no-payment-tools]
+    - id: work-personal-separation
+      scope: chat
+      severity: hard
+      date: 2026-01-01
+      reason: A personal design once leaked into a work channel.
+      enforced_by: [block-work-chat, chat-posts-as-bot]
+    - id: reply-in-thread
+      scope: chat
+      severity: standing
+      date: 2026-01-01
+      reason: Keeps the home channel readable.
+
+tools:
+  mcp_servers:
+    - { id: notes, transport: http, url: "https://mcp.example.com/notes", header_names: [Authorization], enabled: true }
+  skills:
+    - { id: morning-brief, description: Summarise calendar + inbox into five bullets }
+  permissions:
+    allow: ["Read", "Bash(git status*)"]
+    deny: ["Bash(git push --force*)", "mcp__work-chat__*"]
+    ask: []
+  denied_mcp_servers: [work-chat]
+
+loops:
+  - id: com.example.morning-brief
+    runner: launchd
+    enabled: true
+    managed: true
+    schedule: { calendar: ["hour=8,minute=0"] }
+    program: [/bin/bash, ~/assistant/loops/morning-brief.sh]
+    log: ~/assistant/logs/morning-brief.log
+    owner: personal
+    success_metric: brief posted in the home channel before 08:15
+
+channels:
+  slack:
+    - { id: home-channel, role: every reply and report goes here, identity: assistant-bot }
+  email:
+    - { id: outbound-mail, identity: personal-mail, gate: human-voice-gate }
+  todo:
+    - { id: todo, path: ~/assistant/todo.md }
+
+projects:
+  - { id: side-project, description: A small web app, status: active, path: ~/code/side-project }
+
+business:
+  lanes:
+    - { id: newsletter, status: active, goal: grow paid subscribers, metric: paid subs per week, loops: [com.example.morning-brief] }
+
+data:
+  state:
+    - { id: todo, path: ~/assistant/todo.md, kind: todo }
+
+safety:
+  policies:
+    - id: no-payment-tools
+      check: no_payment_tools
+      severity: hard
+      rule: never-spend-money
+    - id: block-work-chat
+      check: deny_mcp
+      severity: hard
+      rule: work-personal-separation
+      params: { servers: [work-chat], tool_patterns: ["mcp__work-chat__*"] }
+    - id: chat-posts-as-bot
+      check: channel_identity
+      severity: hard
+      rule: work-personal-separation
+      params: { kind: slack, allowed: [assistant-bot] }
+    - id: outbound-voice-gate
+      check: required_gate
+      severity: hard
+      params: { gate: human-voice-gate, channel_kinds: [email, social] }
+    - id: secrets-by-reference
+      check: secrets_by_reference
+      severity: hard
+    - id: loops-have-metrics
+      check: loop_success_metric
+      severity: standing
+    - id: few-loops
+      check: max_enabled_loops      # custom check from checks/max-enabled-loops.mjs
+      severity: standing
+      params: { max: 5 }

@@ -1,0 +1,173 @@
+# setup.yaml: the desired state of one person's AI assistant setup.
+#
+# Workflow:
+#   node setup.mjs import  -i <this dir>   # read your machine (read-only) and rewrite this file
+#   node setup.mjs validate -i <this dir>  # schema + cross-reference check
+#   node setup.mjs plan    -i <this dir>   # what differs between this file and your machine (writes nothing)
+#   node setup.mjs verify  -i <this dir>   # drift + safety policies; exits 1 if a hard policy fails
+#   node setup.mjs apply   -i <this dir>   # render config files into <framework>/out/<instance>/ only
+#
+# Rules of the road:
+#   - Secrets: write WHERE a credential lives (a file path, env var NAME, keychain item), never its value.
+#   - Paths: use ~/... or ${env:HOME}; never hardcode your username.
+#   - Identities: name accounts by role (assistant-bot, personal-mail), not by person.
+#   - Hand-written facts that import cannot discover go in overrides.yaml; import merges them in.
+
+version: 1
+meta:
+  instance: {{instance}}
+  description: My assistant setup
+  owner_role: individual
+
+vars:
+  # Referenced elsewhere as ${vars.NAME}. ${env:NAME} reads an environment variable.
+  workspace_root: ${env:HOME}/work
+
+import:
+  importers: all            # or a list: [claude-settings, claude-mcp, claude-skills, launchd, infra]
+  options:
+    launchd:
+      managed_prefixes: [com.example.]   # label prefixes of YOUR jobs; others are reported as vendor jobs
+    infra:
+      repo_roots: ["~"]
+
+# ---------------------------------------------------------------- identity
+identity:
+  person:
+    role: owner
+    timezone: UTC
+  accounts:
+    - id: assistant-bot
+      kind: chat_bot
+      role: the only identity allowed to post in chat
+      credential_ref: ~/.assistant_bot_token   # path to the token file, never the token
+      scopes: [chat:write]
+      access: can_post
+    # - id: personal-mail
+    #   kind: mailbox
+    #   principal: me@example.com
+    #   credential_ref: env:MAIL_APP_PASSWORD
+    #   scopes: [send, read]
+    #   access: can_post
+    # - id: work-chat
+    #   kind: chat_user
+    #   access: forbidden        # never touched by any automation
+
+# ---------------------------------------------------------------- brain
+brain:
+  claude_code:
+    model: opus
+    effort: high
+  runtimes:
+    - id: headless-claude
+      command: claude -p
+      note: used by scheduled loops
+  roster: []
+    # - id: second-opinion
+    #   runtime: another-cli exec
+    #   beat: bulk checks
+  gates:
+    - id: human-voice-gate
+      model: opus
+      threshold: "< 3/10"
+      applies_to: [email, social]
+  budgets:
+    money: 0
+
+# ---------------------------------------------------------------- instructions
+instructions:
+  sources: []
+  rules:
+    - id: never-spend-money
+      scope: money
+      severity: hard          # hard = violation fails verify via a policy; standing = default behaviour
+      date: 2026-01-01
+      reason: The assistant must never move money on its own.
+      statement: No purchases, subscriptions, top-ups or metered paid API calls by any agent or loop.
+      enforced_by: [no-payment-tools]
+    - id: reply-in-thread
+      scope: chat
+      severity: standing
+      date: 2026-01-01
+      reason: Keeps channels readable.
+
+# ---------------------------------------------------------------- tools
+tools:
+  mcp_servers: []
+    # - id: notes
+    #   transport: http
+    #   url: https://mcp.example.com/notes
+    #   header_names: [Authorization]   # names only
+  skills: []
+  plugins: []
+  hooks: []
+    # - id: pre-bash-guard
+    #   event: PreToolUse
+    #   matcher: Bash
+    #   command: ~/.claude/hooks/guard.sh
+  commands: []
+  permissions:
+    allow: []
+    deny: ["Bash(git push --force*)"]
+    ask: []
+  denied_mcp_servers: []
+
+# ---------------------------------------------------------------- loops
+loops: []
+  # - id: com.example.morning-brief
+  #   runner: launchd
+  #   enabled: true
+  #   schedule: { calendar: ["hour=8,minute=0"] }
+  #   program: [/bin/bash, ~/loops/morning-brief.sh]
+  #   log: ~/loops/morning-brief.log
+  #   owner: personal
+  #   success_metric: brief posted before 08:15 every weekday
+
+# ---------------------------------------------------------------- channels
+channels:
+  slack: []
+    # - id: home-channel
+    #   role: every reply and report goes here
+    #   identity: assistant-bot
+  email: []
+    # - id: outbound-mail
+    #   identity: personal-mail
+    #   gate: human-voice-gate
+  social: []
+  calendar: []
+  todo: []
+  journal: []
+
+# ---------------------------------------------------------------- projects
+projects: []
+  # - id: side-project
+  #   description: what it is, in one line
+  #   status: active
+  #   path: ~/code/side-project
+
+# ---------------------------------------------------------------- business lanes
+business:
+  lanes: []
+    # - id: newsletter
+    #   status: active
+    #   goal: grow paid subscribers
+    #   metric: paid subs per week
+    #   loops: [com.example.morning-brief]
+
+# ---------------------------------------------------------------- data & state
+data:
+  state: []
+    # - id: journal
+    #   path: ~/assistant/journal.jsonl
+    #   kind: journal
+
+# ---------------------------------------------------------------- infra
+infra:
+  clis: []
+  repos: []
+  services: []
+
+# ---------------------------------------------------------------- safety
+# Policies can live here or in policies.yaml next to this file (both are merged).
+safety:
+  policies: []

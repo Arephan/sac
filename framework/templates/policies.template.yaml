@@ -1,0 +1,36 @@
+# policies.yaml: machine-checkable safety policies. `verify` runs every one against both
+# setup.yaml (desired) and a fresh read of the machine (live). A failing `hard` policy makes
+# verify exit 1. Check reference: docs/policies.md. Custom checks: <instance>/checks/*.mjs.
+safety:
+  policies:
+    - id: no-payment-tools
+      check: no_payment_tools
+      severity: hard
+      rule: never-spend-money
+      params:
+        allow: []            # ids you have reviewed and accept
+    - id: secrets-by-reference
+      check: secrets_by_reference
+      severity: hard
+    - id: protect-live-config
+      check: forbidden_paths
+      severity: hard
+      params:
+        paths: ["~/.ssh"]    # nothing automated may point at these
+    - id: outbound-voice-gate
+      check: required_gate
+      severity: hard
+      params: { gate: human-voice-gate, channel_kinds: [email, social] }
+    - id: loops-have-metrics
+      check: loop_success_metric
+      severity: standing
+    # - id: block-work-chat
+    #   check: deny_mcp
+    #   severity: hard
+    #   params:
+    #     servers: ["work-chat"]
+    #     tool_patterns: ["mcp__work-chat__*"]
+    # - id: chat-posts-as-bot
+    #   check: channel_identity
+    #   severity: hard
+    #   params: { kind: slack, allowed: [assistant-bot] }
