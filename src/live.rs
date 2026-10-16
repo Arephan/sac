@@ -6,9 +6,11 @@
 //! - `~/.claude/settings.json`: `permissions.allow|deny|ask`, `permissions.defaultMode`,
 //!   `deniedMcpServers`, `hooks`, `enabledPlugins`, `model` and `effortLevel` come from
 //!   setup.yaml. A managed key whose setup.yaml section is absent (or whose scalar is unset)
-//!   keeps its live value; a present section, even an empty one, replaces it. Every other key
-//!   stays as found, and `env` is never written at all: setup.yaml holds env names, not values,
-//!   so the names that still need a value go in the report.
+//!   keeps its live value; a present section, even an empty one, replaces it. `hooks` and
+//!   `deniedMcpServers` are written only when the file lacks them, or with `force`, because
+//!   setup.yaml models them lossily; an existing value that differs is kept and reported.
+//!   Every other key stays as found, and `env` is never written at all: setup.yaml holds env
+//!   names, not values, so the names that still need a value go in the report.
 //! - `~/.claude.json`: user-scope `mcpServers` the file lacks are added (the file is created as
 //!   `{"mcpServers":{}}` when absent). An existing server keeps its `env` and `headers` always,
 //!   and its `command`, `args`, `url`, `type` unless `force`. Disabled and denied servers and
@@ -185,6 +187,8 @@ pub(crate) fn apply_live_in(desired: &Doc, opts: &LiveOptions, real: &Path) -> R
         settings.clone().unwrap_or_default(),
         &claude_settings_doc(desired),
         desired,
+        opts.force,
+        &mut notes,
     );
     let mut t = Target::new(SETTINGS, pretty_json(&Value::Object(merged.clone())));
     t.same_as_existing = settings == Some(merged);
@@ -352,8 +356,17 @@ fn check_containment(home: &Path, real: &Path, rels: &[String]) -> Result<()> {
 
 /// The rendered settings' managed keys over the existing file. A key whose setup.yaml section
 /// is absent keeps its live value, as does an unset `model`, `effortLevel` or `defaultMode`; a
-/// present section replaces it, even when empty.
-fn merge_settings(mut cur: Map<String, Value>, want: &Doc, desired: &Doc) -> Map<String, Value> {
+/// present section replaces it, even when empty. `hooks` and `deniedMcpServers` are written
+/// only when the file lacks them, or with `force`: setup.yaml models them lossily (every hook
+/// becomes a command hook, every denial a server name), so an existing value that differs is
+/// kept and noted.
+fn merge_settings(
+    mut cur: Map<String, Value>,
+    want: &Doc,
+    desired: &Doc,
+    force: bool,
+    notes: &mut Vec<String>,
+) -> Map<String, Value> {
     let declared = |path: &str| get_path(desired, path).is_some();
     for k in ["model", "effortLevel"] {
         if let Some(v) = want.get(k) {
@@ -382,13 +395,19 @@ fn merge_settings(mut cur: Map<String, Value>, want: &Doc, desired: &Doc) -> Map
             }
         }
     }
-    for (k, section) in [
-        ("deniedMcpServers", "tools.denied_mcp_servers"),
-        ("hooks", "tools.hooks"),
-        ("enabledPlugins", "tools.plugins"),
+    for (k, section, lossy) in [
+        ("deniedMcpServers", "tools.denied_mcp_servers", true),
+        ("hooks", "tools.hooks", true),
+        ("enabledPlugins", "tools.plugins", false),
     ] {
-        if declared(section) {
-            if let Some(v) = want.get(k) {
+        let Some(v) = want.get(k).filter(|_| declared(section)) else {
+            continue;
+        };
+        match cur.get(k) {
+            Some(existing) if lossy && !force && existing != v => notes.push(format!(
+                "~/{SETTINGS} {k} (exists and differs; kept, because setup.yaml's model of it is lossy; --force regenerates it)"
+            )),
+            _ => {
                 cur.insert(k.to_string(), v.clone());
             }
         }
@@ -940,9 +959,10 @@ mod tests {
             json!(["~/notes"])
         );
         assert_eq!(s["permissions"]["defaultMode"], json!("acceptEdits"));
+        // `hooks` exists and differs, so without --force it stays as found.
         assert_eq!(
             s["hooks"],
-            crate::apply::claude_settings_doc(&fixture())["hooks"]
+            json!({ "Stop": [ { "hooks": [ { "type": "command", "command": "old.sh" } ] } ] })
         );
         let keys: Vec<&String> = s.as_object().unwrap().keys().collect();
         assert_eq!(&keys[..4], ["env", "theme", "model", "permissions"]);
@@ -1382,10 +1402,18 @@ mod tests {
             .skipped
             .contains(&"~/.claude/settings.json (unchanged)".to_string()));
 
-        // A present section replaces its key, even when empty; absent ones still stay.
+        // A present section replaces its key, even when empty (`hooks` only with --force,
+        // since setup.yaml models hooks lossily); absent ones stay, with --force too.
         let some = json!({ "version": 1, "meta": { "instance": "alex" },
                            "tools": { "hooks": [], "permissions": { "allow": ["Read"] } } });
         live(&some, &opts(home, true, false)).unwrap();
+        let s = read_json(&path);
+        assert_eq!(
+            s["hooks"],
+            json!({ "Stop": [{ "hooks": [{ "type": "command", "command": "done.sh" }] }] })
+        );
+        assert_eq!(s["permissions"]["allow"], json!(["Read"]));
+        live(&some, &opts(home, true, true)).unwrap();
         let s = read_json(&path);
         assert_eq!(s["hooks"], json!({}));
         assert_eq!(s["permissions"]["allow"], json!(["Read"]));
@@ -1394,6 +1422,87 @@ mod tests {
         assert_eq!(s["deniedMcpServers"], json!([{ "serverName": "bad" }]));
         assert_eq!(s["enabledPlugins"], json!({ "helper@example": true }));
         assert_eq!(s["model"], json!("sonnet"));
+    }
+
+    /// The note live leaves for a lossy settings key it kept.
+    fn lossy_note(key: &str) -> String {
+        format!("~/.claude/settings.json {key} (exists and differs; kept, because setup.yaml's model of it is lossy; --force regenerates it)")
+    }
+
+    #[test]
+    fn live_keeps_existing_hooks_and_denied_servers_unless_forced() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = &canon(tmp.path());
+        std::fs::create_dir_all(home.join(".claude")).unwrap();
+        // What setup.yaml cannot represent: a prompt hook with a timeout, a denial by URL.
+        let hooks = json!({ "Stop": [{ "hooks": [{ "type": "prompt", "prompt": "Check the work.", "timeout": 30 }] }] });
+        let denied = json!([{ "serverUrl": "https://chat.example.com/*" }]);
+        let path = home.join(".claude/settings.json");
+        let before = json!({ "model": "sonnet", "hooks": hooks, "deniedMcpServers": denied });
+        std::fs::write(&path, pretty_json(&before)).unwrap();
+        let want = crate::apply::claude_settings_doc(&fixture());
+
+        let r = live(&fixture(), &opts(home, true, false)).unwrap();
+        let s = read_json(&path);
+        assert_eq!(s["hooks"], hooks);
+        assert_eq!(s["deniedMcpServers"], denied);
+        // The other managed keys still come from setup.yaml.
+        assert_eq!(s["model"], json!("opus"));
+        assert_eq!(s["permissions"], want["permissions"]);
+        for key in ["hooks", "deniedMcpServers"] {
+            assert!(r.skipped.contains(&lossy_note(key)), "{:?}", r.skipped);
+        }
+        let report = read(&home.join(".claude/setup-as-code/report.md"));
+        assert!(
+            report.contains(&format!("- {}", lossy_note("hooks"))),
+            "{report}"
+        );
+
+        let r = live(&fixture(), &opts(home, true, true)).unwrap();
+        let s = read_json(&path);
+        assert_eq!(s["hooks"], want["hooks"]);
+        assert_eq!(s["deniedMcpServers"], want["deniedMcpServers"]);
+        assert!(
+            !r.skipped.iter().any(|x| x.contains("lossy")),
+            "{:?}",
+            r.skipped
+        );
+        let backup = r.backup_dir.expect("the forced run rewrote settings.json");
+        assert_eq!(
+            read_json(&backup.join(".claude/settings.json"))["hooks"],
+            hooks
+        );
+
+        // Once they match setup.yaml there is nothing to keep and nothing to say.
+        let r = live(&fixture(), &opts(home, true, false)).unwrap();
+        assert!(
+            !r.skipped.iter().any(|x| x.contains("lossy")),
+            "{:?}",
+            r.skipped
+        );
+        assert!(r
+            .skipped
+            .contains(&"~/.claude/settings.json (unchanged)".to_string()));
+    }
+
+    #[test]
+    fn live_writes_hooks_and_denied_servers_a_settings_file_lacks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = &canon(tmp.path());
+        std::fs::create_dir_all(home.join(".claude")).unwrap();
+        let path = home.join(".claude/settings.json");
+        std::fs::write(&path, r#"{ "theme": "dark" }"#).unwrap();
+        let r = live(&fixture(), &opts(home, true, false)).unwrap();
+        let s = read_json(&path);
+        let want = crate::apply::claude_settings_doc(&fixture());
+        assert_eq!(s["hooks"], want["hooks"]);
+        assert_eq!(s["deniedMcpServers"], want["deniedMcpServers"]);
+        assert_eq!(s["theme"], json!("dark"));
+        assert!(
+            !r.skipped.iter().any(|x| x.contains("lossy")),
+            "{:?}",
+            r.skipped
+        );
     }
 
     #[cfg(unix)]
