@@ -28,10 +28,10 @@ fn patterns() -> &'static Vec<(&'static str, Regex)> {
             ("private-key-block", r"-----BEGIN (?:RSA |EC |OPENSSH |PGP )?PRIVATE KEY-----"),
             ("jwt", r"(?-u:\b)eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}"),
             ("bearer-header", r"(?-u:\b)Bearer\s+[A-Za-z0-9._~+/-]{20,}=*"),
-            ("url-credentials", r"(?i)\b[a-z][a-z0-9+.-]*://[^\s:/@]+:[^\s:/@]{6,}@"),
+            ("url-credentials", r"(?i)(?-u:\b)[a-z][a-z0-9+.-]*://[^\s:/@]+:[^\s:/@]{6,}@"),
             (
                 "generic-assignment",
-                r#"(?i)\b(?:api[_-]?key|secret|token|password|passwd)\s*[:=]\s*["']?[A-Za-z0-9_\-/+=]{24,}"#,
+                r#"(?i)(?-u:\b)(?:api[_-]?key|secret|token|password|passwd)\s*[:=]\s*["']?[A-Za-z0-9_\-/+=]{24,}"#,
             ),
         ];
         defs.iter()
