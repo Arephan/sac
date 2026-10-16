@@ -6,6 +6,7 @@
 use super::rules::{entries, js_order, js_string, key_list, present, truthy};
 use super::Importer;
 use crate::ctx::Ctx;
+use crate::secrets::find_secrets;
 use crate::util::{arr, is_truthy, slug};
 use crate::Doc;
 use anyhow::Result;
@@ -75,6 +76,19 @@ fn home_rule_paths(rule: &str, home: &str) -> String {
     }
     out.push_str(&rule[copied..]);
     out
+}
+
+/// Claude Code matches a `Bash(...)` rule against the command text as typed and does not
+/// expand `~` inside it, so a home path in it must stay exactly as written: no `~` rewrite of
+/// any kind. A secret-shaped value is still dropped, with the warning `Ctx::scrub` gives.
+fn scrub_bash_rule(ctx: &Ctx, rule: &str) -> Doc {
+    match find_secrets(rule).first() {
+        Some(hit) => {
+            ctx.warn(format!("dropped a secret-looking value ({})", hit.id));
+            json!("<redacted>")
+        }
+        None => json!(rule),
+    }
 }
 
 /// One entry per hook command, keyed `<event>-<matcher or any>-<last path segment>`.
@@ -167,12 +181,14 @@ impl Importer for ClaudeSettings {
         }
         // All three lists are scrubbed. The reference scrubs only `allow`; scrubbing `deny`
         // and `ask` too keeps home paths and secret-shaped values out of the manifest. Rules in
-        // Claude Code's `//<home>` form are rewritten to `~` first so they keep their meaning.
+        // Claude Code's `//<home>` form are rewritten to `~` first so they keep their meaning,
+        // and `Bash(...)` rules keep their home paths as written (only secrets are dropped).
         let home = ctx.home().to_string_lossy().to_string();
         for key in ["allow", "deny", "ask"] {
             let list: Vec<Doc> = uniq(&[perms.get(key), local_perms.get(key)])
                 .iter()
                 .map(|x| match x {
+                    Value::String(rule) if rule.starts_with("Bash(") => scrub_bash_rule(ctx, rule),
                     Value::String(rule) => ctx.scrub(&Value::String(home_rule_paths(rule, &home))),
                     other => ctx.scrub(other),
                 })
@@ -366,7 +382,7 @@ mod tests {
               "permissions": {
                 "allow": ["Read(/@HOME@/notes/**)", "Edit(/@HOME@)"],
                 "deny": ["Read(/@HOME@/.ssh/**)", "Read(/@HOME@/.config/app/*.json)"],
-                "ask": ["Edit(/@HOME@/.zshrc)", "Bash(cat /@HOME@/notes/todo.md)"]
+                "ask": ["Edit(/@HOME@/.zshrc)", "Write(/@HOME@/notes/todo.md)"]
               }
             }"#,
         );
@@ -377,10 +393,42 @@ mod tests {
             json!({
                 "allow": ["Read(~/notes/**)", "Edit(~)"],
                 "deny": ["Read(~/.ssh/**)", "Read(~/.config/app/*.json)"],
-                "ask": ["Edit(~/.zshrc)", "Bash(cat ~/notes/todo.md)"]
+                "ask": ["Edit(~/.zshrc)", "Write(~/notes/todo.md)"]
             })
         );
         assert!(ctx.warnings().is_empty());
+    }
+
+    #[test]
+    fn settings_bash_rules_keep_absolute_home_paths() {
+        let h = home();
+        // `@HOME@` is the absolute home: `@HOME@/x` is a plain absolute path and `/@HOME@/x`
+        // is Claude Code's `//` form.
+        h.write(
+            ".claude/settings.json",
+            r#"{
+              "permissions": {
+                "allow": ["Bash(node @HOME@/x/run.mjs)", "Read(/@HOME@/x/**)"],
+                "deny": ["Bash(node @HOME@/x/deploy.mjs:*)", "Read(/@HOME@/x/**)"],
+                "ask": ["Bash(cat /@HOME@/x/notes.md)", "Bash(curl -H @TOKEN@ @HOME@/x)"]
+              }
+            }"#,
+        );
+        let ctx = h.ctx();
+        let f = ClaudeSettings.run(&ctx, &json!({})).unwrap();
+        let home = h.s();
+        // Bash rules match the command text as typed and `~` is not expanded in them, so the
+        // home path stays exactly as written (`//` included); other rules still get `~/`.
+        assert_eq!(
+            f["tools"]["permissions"],
+            json!({
+                "allow": [format!("Bash(node {home}/x/run.mjs)"), "Read(~/x/**)"],
+                "deny": [format!("Bash(node {home}/x/deploy.mjs:*)"), "Read(~/x/**)"],
+                "ask": [format!("Bash(cat /{home}/x/notes.md)"), "<redacted>"]
+            })
+        );
+        // a secret-shaped Bash rule is still dropped, with the usual warning
+        assert_eq!(ctx.warnings(), [DROPPED]);
     }
 
     #[test]
