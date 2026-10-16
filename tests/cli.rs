@@ -206,14 +206,11 @@ fn import_reads_the_whole_home() {
     assert_eq!(repo["path"], "~/code/app");
     assert!(repo.get("last_commit").is_none());
     assert_eq!(find(&d, "infra.clis", "git")["present"], true);
-    assert_eq!(
-        get_path(&d, "infra.machine.platform")
-            .unwrap()
-            .as_str()
-            .unwrap()
-            .is_empty(),
-        false
-    );
+    assert!(!get_path(&d, "infra.machine.platform")
+        .unwrap()
+        .as_str()
+        .unwrap()
+        .is_empty());
 
     // declared-only collections survive the import
     assert_eq!(ids(&d, "brain.gates"), vec!["human-voice-gate"]);
@@ -274,11 +271,14 @@ fn plan_detects_drift_and_verify_exit_codes() {
     let p2 = sac(&["plan", "-i", i, "--home", home, "--json"], root);
     assert_eq!(p2.code, 0, "{}", p2.out());
     let j: Value = serde_json::from_str(&p2.stdout).unwrap();
-    assert_eq!(j["totals"]["add"], 1, "{}", p2.stdout);
+    // the removed plist is still declared in overrides.yaml, so it shows as changed
+    // (status installed vs declared-only), while the new skill is untracked on the machine
+    assert_eq!(j["totals"]["add"], 0, "{}", p2.stdout);
+    assert_eq!(j["totals"]["change"], 1, "{}", p2.stdout);
     assert_eq!(j["totals"]["untracked"], 1, "{}", p2.stdout);
     let text = sac(&["plan", "-i", i, "--home", home], root).stdout;
     assert!(text.contains("- tools.skills new-skill"), "{text}");
-    assert!(text.contains("+ loops com.example.watch"), "{text}");
+    assert!(text.contains("~ loops com.example.watch"), "{text}");
     let d = sac(
         &["verify", "-i", i, "--home", home, "--fail-on-drift"],
         root,
