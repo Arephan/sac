@@ -4,6 +4,10 @@
 //! parsed in-process, and `launchctl list` / `launchctl print-disabled` run only for the real
 //! home on macOS. Nothing is ever loaded, unloaded or bootstrapped.
 //!
+//! The importer runs on any OS whose home has the folder, so a sandbox home (`--home`) reads
+//! the same on Linux as on macOS; only the `launchctl` probes need the real home on macOS.
+//! Hidden files (a name starting with `.`, such as AppleDouble `._x.plist`) are not jobs.
+//!
 //! `options.managed_prefixes`: label prefixes that belong to this person (others are vendor jobs).
 
 use super::Importer;
@@ -282,7 +286,10 @@ fn scan(ctx: &Ctx, opts: &Doc, probes: &Probes) -> Doc {
             ctx.list(&disabled_dir)
                 .into_iter()
                 .map(|f| (format!("{disabled_dir}/{f}"), f, true)),
-        );
+        )
+        // Hidden files: AppleDouble `._x.plist` companions, or a bare `.plist` that would
+        // become a job with an empty id.
+        .filter(|(_, f, _)| !f.starts_with('.'));
 
     // Group every file by label, then describe the job from its best file:
     // installed plist > parked copy (disabled/killed/renamed) > backup copy.
@@ -423,10 +430,12 @@ impl Importer for Launchd {
     fn description(&self) -> &str {
         "launchd user agents incl. disabled/parked/removed ones (read-only)."
     }
+    /// The folder alone decides, on any OS: a sandbox home on Linux imports its plists too.
     fn detect(&self, ctx: &Ctx) -> bool {
-        ctx.platform() == "darwin" && ctx.is_dir(DIR)
+        ctx.is_dir(DIR)
     }
     fn run(&self, ctx: &Ctx, opts: &Doc) -> Result<Doc> {
+        // `launchctl` runs only for the real home, and `Probes::gather` only on macOS.
         let probes = if ctx.is_real_home() {
             Probes::gather(ctx)
         } else {
@@ -975,12 +984,61 @@ mod tests {
     }
 
     #[test]
-    fn detect_needs_macos_and_the_folder() {
+    fn detect_needs_only_the_folder_on_any_os() {
         let tmp = tempfile::tempdir().unwrap();
         let ctx = Ctx::new(Some(tmp.path()), json!({}));
+        assert!(!ctx.is_real_home());
         assert!(!Launchd.detect(&ctx));
         assert_eq!(Launchd.run(&ctx, &json!({})).unwrap()["loops"], json!([]));
-        std::fs::create_dir_all(tmp.path().join("Library/LaunchAgents")).unwrap();
-        assert_eq!(Launchd.detect(&ctx), cfg!(target_os = "macos"));
+        let la = tmp.path().join("Library/LaunchAgents");
+        std::fs::create_dir_all(&la).unwrap();
+        write_plist(&la.join("com.example.a.plist"), &labelled("com.example.a"));
+        // A sandbox home needs no launchctl, so the same holds on Linux: the folder is enough.
+        assert!(Launchd.detect(&ctx));
+        let all = loops(&ctx, json!({}));
+        assert_eq!(all.len(), 1);
+        assert_eq!(
+            (&all[0]["id"], &all[0]["status"], &all[0]["enabled"]),
+            (&json!("com.example.a"), &json!("installed"), &json!(true))
+        );
+    }
+
+    #[test]
+    fn dotfiles_are_skipped_in_both_folders() {
+        let t = home();
+        write_plist(
+            &t.la.join("com.example.real.plist"),
+            &labelled("com.example.real"),
+        );
+        // A bare `.plist` once became a loop with an empty id, which fails the schema.
+        std::fs::write(t.la.join(".plist"), "not a plist").unwrap();
+        // An AppleDouble companion, as a non-APFS volume leaves next to each file.
+        std::fs::write(
+            t.la.join("._com.example.x.plist"),
+            b"\x00\x05\x16\x07\x00\x02\x00\x00Mac OS X        ",
+        )
+        .unwrap();
+        // Hidden files are skipped whatever they hold, in `disabled/` too.
+        write_plist(
+            &t.la.join("disabled/._com.example.y.plist"),
+            &labelled("com.example.y"),
+        );
+        write_plist(
+            &t.la.join("disabled/.plist"),
+            &labelled("com.example.hidden"),
+        );
+        let out = Launchd.run(&t.ctx, &json!({})).unwrap();
+        let ids: Vec<&str> = out["loops"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|l| l["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, ["com.example.real"]);
+        assert_eq!(
+            out["loops"][0]["files"],
+            json!(["~/Library/LaunchAgents/com.example.real.plist"])
+        );
+        assert!(t.ctx.warnings().is_empty(), "{:?}", t.ctx.warnings());
     }
 }

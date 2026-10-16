@@ -6,9 +6,11 @@
 //! - `~/.claude/settings.json`: `permissions.allow|deny|ask`, `permissions.defaultMode`,
 //!   `deniedMcpServers`, `hooks`, `enabledPlugins`, `model` and `effortLevel` come from
 //!   setup.yaml. A managed key whose setup.yaml section is absent (or whose scalar is unset)
-//!   keeps its live value; a present section, even an empty one, replaces it. Every other key
-//!   stays as found, and `env` is never written at all: setup.yaml holds env names, not values,
-//!   so the names that still need a value go in the report.
+//!   keeps its live value; a present section, even an empty one, replaces it. `hooks` and
+//!   `deniedMcpServers` are written only when the file lacks them, or with `force`, because
+//!   setup.yaml models them lossily; an existing value that differs is kept and reported.
+//!   Every other key stays as found, and `env` is never written at all: setup.yaml holds env
+//!   names, not values, so the names that still need a value go in the report.
 //! - `~/.claude.json`: user-scope `mcpServers` the file lacks are added (the file is created as
 //!   `{"mcpServers":{}}` when absent). An existing server keeps its `env` and `headers` always,
 //!   and its `command`, `args`, `url`, `type` unless `force`. Disabled and denied servers and
@@ -16,6 +18,10 @@
 //! - launchd plists: `~/Library/LaunchAgents/<label>.plist`, disabled loops under `disabled/`,
 //!   written when missing or with `force`. `launchctl` is never run.
 //! - `~/.claude/setup-as-code/{RULES.md,setup.lock.json,report.md}`: regenerated every run.
+//! - settings.json, .claude.json or a plist into which this run would put the `<redacted>`
+//!   placeholder (where import dropped a secret-shaped value) is not written at all, whatever
+//!   `force` says; it is reported with the paths of the placeholders. A placeholder the file
+//!   already held at the same place does not count.
 //! - A malformed existing settings.json or .claude.json stops the run before any backup or write.
 //! - Containment: every path the run may write, and the backup directory, is resolved through
 //!   symlinks first, and the run is refused when one lands outside the home. For a home that is
@@ -25,8 +31,9 @@
 //! - Writes are atomic (temp file + rename) and go through a symlinked file to its target.
 
 use crate::apply::{
-    absolute_home, claude_settings_doc, instance_name, lock_doc, mcp_entry, mcp_excluded,
-    mcp_project_scoped, plist_loops, plist_xml, pretty_json, protected_hit, resolve, rules_md,
+    absolute_home, claude_settings_doc, code_list, instance_name, lock_doc, mcp_entry,
+    mcp_excluded, mcp_project_scoped, plist_loops, plist_redacted_paths, plist_xml, pretty_json,
+    protected_hit, redacted_paths, resolve, rules_md, REDACTED,
 };
 use crate::ctx::real_home;
 use crate::util::{arr, get_path, now_iso, str_list};
@@ -64,6 +71,8 @@ enum Action {
     /// Exists and is only replaced with `force`.
     Keep,
     Unchanged,
+    /// Would carry the `<redacted>` placeholder: never written.
+    Redacted,
 }
 
 /// One file the run may write, by path relative to the home.
@@ -82,6 +91,8 @@ struct Target {
     launch: bool,
     /// Names written as `${NAME}` placeholders that still need a value.
     fill_in: Vec<String>,
+    /// Where writing this file would put the `<redacted>` placeholder; any refuses the file.
+    redacted: Vec<String>,
     action: Action,
 }
 
@@ -96,6 +107,7 @@ impl Target {
             private: false,
             launch: false,
             fill_in: Vec::new(),
+            redacted: Vec::new(),
             action: Action::Create,
         }
     }
@@ -185,18 +197,27 @@ pub(crate) fn apply_live_in(desired: &Doc, opts: &LiveOptions, real: &Path) -> R
         settings.clone().unwrap_or_default(),
         &claude_settings_doc(desired),
         desired,
+        opts.force,
+        &mut notes,
     );
-    let mut t = Target::new(SETTINGS, pretty_json(&Value::Object(merged.clone())));
-    t.same_as_existing = settings == Some(merged);
-    let mut targets = vec![t];
+    // A JSON target over the file as found: only placeholders this run would add count.
+    let json_target =
+        |rel: &str, merged: Map<String, Value>, found: &Option<Map<String, Value>>| {
+            let merged = Value::Object(merged);
+            let found = found.clone().map(Value::Object);
+            let mut t = Target::new(rel, pretty_json(&merged));
+            t.redacted = redacted_paths(&merged, found.as_ref(), "");
+            t.same_as_existing = found.as_ref() == Some(&merged);
+            t
+        };
+    let mut targets = vec![json_target(SETTINGS, merged, &settings)];
     let (merged, added) = merge_claude_json(
         claude_json.clone().unwrap_or_default(),
         desired,
         opts.force,
         &mut notes,
     );
-    let mut t = Target::new(CLAUDE_JSON, pretty_json(&Value::Object(merged.clone())));
-    t.same_as_existing = claude_json == Some(merged);
+    let mut t = json_target(CLAUDE_JSON, merged, &claude_json);
     t.private = true;
     t.fill_in = added;
     targets.push(t);
@@ -205,6 +226,7 @@ pub(crate) fn apply_live_in(desired: &Doc, opts: &LiveOptions, real: &Path) -> R
         t.force_only = true;
         t.launch = *enabled;
         t.fill_in = str_list(l.get("env_names"));
+        t.redacted = plist_redacted_paths(l);
         targets.push(t);
     }
     targets.push(Target::state("RULES.md", rules_md(desired)));
@@ -216,6 +238,10 @@ pub(crate) fn apply_live_in(desired: &Doc, opts: &LiveOptions, real: &Path) -> R
     targets.push(Target::state("report.md", String::new()));
     for t in &mut targets {
         t.action = decide(home, t, opts.force)?;
+        // Skipped whole: no copy with the placeholder, and no copy that leaves it out.
+        if t.writes() && !t.redacted.is_empty() {
+            t.action = Action::Redacted;
+        }
     }
 
     let backup_dir = if targets.iter().any(|t| t.action == Action::Update) {
@@ -238,6 +264,11 @@ pub(crate) fn apply_live_in(desired: &Doc, opts: &LiveOptions, real: &Path) -> R
         .filter_map(|t| match t.action {
             Action::Keep => Some(format!("~/{} (exists; --force overwrites)", t.rel)),
             Action::Unchanged => Some(format!("~/{} (unchanged)", t.rel)),
+            Action::Redacted => Some(format!(
+                "~/{} (not written: setup.yaml would put the placeholder `{REDACTED}` at {}, where import dropped a secret-shaped value)",
+                t.rel,
+                code_list(&t.redacted)
+            )),
             _ => None,
         })
         .collect();
@@ -352,8 +383,17 @@ fn check_containment(home: &Path, real: &Path, rels: &[String]) -> Result<()> {
 
 /// The rendered settings' managed keys over the existing file. A key whose setup.yaml section
 /// is absent keeps its live value, as does an unset `model`, `effortLevel` or `defaultMode`; a
-/// present section replaces it, even when empty.
-fn merge_settings(mut cur: Map<String, Value>, want: &Doc, desired: &Doc) -> Map<String, Value> {
+/// present section replaces it, even when empty. `hooks` and `deniedMcpServers` are written
+/// only when the file lacks them, or with `force`: setup.yaml models them lossily (every hook
+/// becomes a command hook, every denial a server name), so an existing value that differs is
+/// kept and noted.
+fn merge_settings(
+    mut cur: Map<String, Value>,
+    want: &Doc,
+    desired: &Doc,
+    force: bool,
+    notes: &mut Vec<String>,
+) -> Map<String, Value> {
     let declared = |path: &str| get_path(desired, path).is_some();
     for k in ["model", "effortLevel"] {
         if let Some(v) = want.get(k) {
@@ -382,13 +422,19 @@ fn merge_settings(mut cur: Map<String, Value>, want: &Doc, desired: &Doc) -> Map
             }
         }
     }
-    for (k, section) in [
-        ("deniedMcpServers", "tools.denied_mcp_servers"),
-        ("hooks", "tools.hooks"),
-        ("enabledPlugins", "tools.plugins"),
+    for (k, section, lossy) in [
+        ("deniedMcpServers", "tools.denied_mcp_servers", true),
+        ("hooks", "tools.hooks", true),
+        ("enabledPlugins", "tools.plugins", false),
     ] {
-        if declared(section) {
-            if let Some(v) = want.get(k) {
+        let Some(v) = want.get(k).filter(|_| declared(section)) else {
+            continue;
+        };
+        match cur.get(k) {
+            Some(existing) if lossy && !force && existing != v => notes.push(format!(
+                "~/{SETTINGS} {k} (exists and differs; kept, because setup.yaml's model of it is lossy; --force regenerates it)"
+            )),
+            _ => {
                 cur.insert(k.to_string(), v.clone());
             }
         }
@@ -940,9 +986,10 @@ mod tests {
             json!(["~/notes"])
         );
         assert_eq!(s["permissions"]["defaultMode"], json!("acceptEdits"));
+        // `hooks` exists and differs, so without --force it stays as found.
         assert_eq!(
             s["hooks"],
-            crate::apply::claude_settings_doc(&fixture())["hooks"]
+            json!({ "Stop": [ { "hooks": [ { "type": "command", "command": "old.sh" } ] } ] })
         );
         let keys: Vec<&String> = s.as_object().unwrap().keys().collect();
         assert_eq!(&keys[..4], ["env", "theme", "model", "permissions"]);
@@ -1382,10 +1429,18 @@ mod tests {
             .skipped
             .contains(&"~/.claude/settings.json (unchanged)".to_string()));
 
-        // A present section replaces its key, even when empty; absent ones still stay.
+        // A present section replaces its key, even when empty (`hooks` only with --force,
+        // since setup.yaml models hooks lossily); absent ones stay, with --force too.
         let some = json!({ "version": 1, "meta": { "instance": "alex" },
                            "tools": { "hooks": [], "permissions": { "allow": ["Read"] } } });
         live(&some, &opts(home, true, false)).unwrap();
+        let s = read_json(&path);
+        assert_eq!(
+            s["hooks"],
+            json!({ "Stop": [{ "hooks": [{ "type": "command", "command": "done.sh" }] }] })
+        );
+        assert_eq!(s["permissions"]["allow"], json!(["Read"]));
+        live(&some, &opts(home, true, true)).unwrap();
         let s = read_json(&path);
         assert_eq!(s["hooks"], json!({}));
         assert_eq!(s["permissions"]["allow"], json!(["Read"]));
@@ -1394,6 +1449,184 @@ mod tests {
         assert_eq!(s["deniedMcpServers"], json!([{ "serverName": "bad" }]));
         assert_eq!(s["enabledPlugins"], json!({ "helper@example": true }));
         assert_eq!(s["model"], json!("sonnet"));
+    }
+
+    /// The note live leaves for a lossy settings key it kept.
+    fn lossy_note(key: &str) -> String {
+        format!("~/.claude/settings.json {key} (exists and differs; kept, because setup.yaml's model of it is lossy; --force regenerates it)")
+    }
+
+    #[test]
+    fn live_keeps_existing_hooks_and_denied_servers_unless_forced() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = &canon(tmp.path());
+        std::fs::create_dir_all(home.join(".claude")).unwrap();
+        // What setup.yaml cannot represent: a prompt hook with a timeout, a denial by URL.
+        let hooks = json!({ "Stop": [{ "hooks": [{ "type": "prompt", "prompt": "Check the work.", "timeout": 30 }] }] });
+        let denied = json!([{ "serverUrl": "https://chat.example.com/*" }]);
+        let path = home.join(".claude/settings.json");
+        let before = json!({ "model": "sonnet", "hooks": hooks, "deniedMcpServers": denied });
+        std::fs::write(&path, pretty_json(&before)).unwrap();
+        let want = crate::apply::claude_settings_doc(&fixture());
+
+        let r = live(&fixture(), &opts(home, true, false)).unwrap();
+        let s = read_json(&path);
+        assert_eq!(s["hooks"], hooks);
+        assert_eq!(s["deniedMcpServers"], denied);
+        // The other managed keys still come from setup.yaml.
+        assert_eq!(s["model"], json!("opus"));
+        assert_eq!(s["permissions"], want["permissions"]);
+        for key in ["hooks", "deniedMcpServers"] {
+            assert!(r.skipped.contains(&lossy_note(key)), "{:?}", r.skipped);
+        }
+        let report = read(&home.join(".claude/setup-as-code/report.md"));
+        assert!(
+            report.contains(&format!("- {}", lossy_note("hooks"))),
+            "{report}"
+        );
+
+        let r = live(&fixture(), &opts(home, true, true)).unwrap();
+        let s = read_json(&path);
+        assert_eq!(s["hooks"], want["hooks"]);
+        assert_eq!(s["deniedMcpServers"], want["deniedMcpServers"]);
+        assert!(
+            !r.skipped.iter().any(|x| x.contains("lossy")),
+            "{:?}",
+            r.skipped
+        );
+        let backup = r.backup_dir.expect("the forced run rewrote settings.json");
+        assert_eq!(
+            read_json(&backup.join(".claude/settings.json"))["hooks"],
+            hooks
+        );
+
+        // Once they match setup.yaml there is nothing to keep and nothing to say.
+        let r = live(&fixture(), &opts(home, true, false)).unwrap();
+        assert!(
+            !r.skipped.iter().any(|x| x.contains("lossy")),
+            "{:?}",
+            r.skipped
+        );
+        assert!(r
+            .skipped
+            .contains(&"~/.claude/settings.json (unchanged)".to_string()));
+    }
+
+    #[test]
+    fn live_writes_hooks_and_denied_servers_a_settings_file_lacks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = &canon(tmp.path());
+        std::fs::create_dir_all(home.join(".claude")).unwrap();
+        let path = home.join(".claude/settings.json");
+        std::fs::write(&path, r#"{ "theme": "dark" }"#).unwrap();
+        let r = live(&fixture(), &opts(home, true, false)).unwrap();
+        let s = read_json(&path);
+        let want = crate::apply::claude_settings_doc(&fixture());
+        assert_eq!(s["hooks"], want["hooks"]);
+        assert_eq!(s["deniedMcpServers"], want["deniedMcpServers"]);
+        assert_eq!(s["theme"], json!("dark"));
+        assert!(
+            !r.skipped.iter().any(|x| x.contains("lossy")),
+            "{:?}",
+            r.skipped
+        );
+    }
+
+    /// The note live leaves for a file it refused because of the placeholder.
+    fn placeholder_note(rel: &str, at: &str) -> String {
+        format!("~/{rel} (not written: setup.yaml would put the placeholder `<redacted>` at `{at}`, where import dropped a secret-shaped value)")
+    }
+
+    #[test]
+    fn live_never_writes_the_redacted_placeholder() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = &canon(tmp.path());
+        let d = crate::apply::tests::fixture_with_placeholders();
+        let r = live(&d, &opts(home, true, false)).unwrap();
+        // Each file the placeholder would reach is skipped whole, never written without it.
+        assert!(!home.join(".claude/settings.json").exists());
+        assert!(!home.join(".claude.json").exists());
+        assert!(!agents(home).join("com.example.morning.plist").exists());
+        assert!(agents(home)
+            .join("disabled/com.example.sweep.plist")
+            .is_file());
+        assert!(r.commands.is_empty(), "{:?}", r.commands);
+        for note in [
+            placeholder_note(".claude/settings.json", "permissions.allow[2]"),
+            placeholder_note(".claude.json", "mcpServers.files.args[1]"),
+            placeholder_note(
+                "Library/LaunchAgents/com.example.morning.plist",
+                "program[1]",
+            ),
+        ] {
+            assert!(r.skipped.contains(&note), "{note}\n{:?}", r.skipped);
+        }
+        let mut changed = r.changed.clone();
+        changed.sort();
+        assert_eq!(
+            changed,
+            [
+                "~/.claude/setup-as-code/RULES.md",
+                "~/.claude/setup-as-code/report.md",
+                "~/.claude/setup-as-code/setup.lock.json",
+                "~/Library/LaunchAgents/disabled/com.example.sweep.plist",
+            ]
+        );
+        // Only the report, which names the refused files, mentions the placeholder.
+        let report = read(&home.join(".claude/setup-as-code/report.md"));
+        assert!(
+            report.contains(&format!(
+                "- {}",
+                placeholder_note(".claude.json", "mcpServers.files.args[1]")
+            )),
+            "{report}"
+        );
+        for f in files_below(home) {
+            let text = read(&home.join(&f));
+            let carries = text.contains("<redacted>") || text.contains("&lt;redacted&gt;");
+            assert_eq!(carries, f == ".claude/setup-as-code/report.md", "{f}");
+        }
+    }
+
+    #[test]
+    fn live_leaves_existing_files_whole_when_the_placeholder_would_land_in_them() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = &canon(tmp.path());
+        std::fs::create_dir_all(home.join(".claude")).unwrap();
+        std::fs::create_dir_all(agents(home)).unwrap();
+        let settings = r#"{ "theme": "dark" }"#;
+        let claude_json = r#"{ "numStartups": 3 }"#;
+        let morning = agents(home).join("com.example.morning.plist");
+        std::fs::write(home.join(".claude/settings.json"), settings).unwrap();
+        std::fs::write(home.join(".claude.json"), claude_json).unwrap();
+        std::fs::write(&morning, "old plist").unwrap();
+
+        let d = crate::apply::tests::fixture_with_placeholders();
+        let r = live(&d, &opts(home, true, true)).unwrap();
+        assert_eq!(read(&home.join(".claude/settings.json")), settings);
+        assert_eq!(read(&home.join(".claude.json")), claude_json);
+        assert_eq!(read(&morning), "old plist");
+        assert!(r.commands.is_empty(), "{:?}", r.commands);
+        assert!(r.backup_dir.is_none(), "nothing that existed was written");
+        assert!(r.skipped.contains(&placeholder_note(
+            "Library/LaunchAgents/com.example.morning.plist",
+            "program[1]"
+        )));
+    }
+
+    #[test]
+    fn live_writes_a_file_that_already_held_the_placeholder() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = &canon(tmp.path());
+        // The word sits in the file already (say, a past prompt); this run adds none.
+        let before =
+            json!({ "projects": { "/w": { "history": [{ "display": "why <redacted>?" }] } } });
+        std::fs::write(home.join(".claude.json"), pretty_json(&before)).unwrap();
+        let r = live(&fixture(), &opts(home, true, false)).unwrap();
+        let cj = read_json(&home.join(".claude.json"));
+        assert_eq!(cj["projects"], before["projects"]);
+        assert_eq!(cj["mcpServers"], mcp_servers_doc(&fixture())["mcpServers"]);
+        assert!(r.changed.contains(&"~/.claude.json".to_string()));
     }
 
     #[cfg(unix)]

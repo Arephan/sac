@@ -43,8 +43,20 @@ impl Importer for ClaudeSkills {
             if !ctx.exists(&file) {
                 continue;
             }
-            // A refused or unreadable SKILL.md fails the whole importer, as in the reference.
-            let fm = frontmatter(&ctx.read_text(&file)?);
+            // A refused or unreadable SKILL.md (a directory name holding "token" trips the
+            // secret-file rule) costs only its description, with a warning. The reference
+            // failed the whole importer instead.
+            let text = match ctx.read_text(&file) {
+                Ok(text) => text,
+                Err(e) => {
+                    ctx.warn(format!(
+                        "{e:#}; skill {name} is listed without a description"
+                    ));
+                    skills.push(json!({ "id": name, "source": js_shown(ctx, &file) }));
+                    continue;
+                }
+            };
+            let fm = frontmatter(&text);
             let raw = truthy(fm.get("description"))
                 .map(js_string)
                 .unwrap_or_default();
@@ -161,6 +173,58 @@ mod tests {
             json!("Reads ~/notes/today.md every morning")
         );
         assert_eq!(ctx.warnings(), [DROPPED]);
+        assert!(!f.to_string().contains(&h.s()));
+    }
+
+    #[test]
+    fn a_skill_md_that_cannot_be_read_is_listed_without_a_description() {
+        let h = home();
+        h.write(
+            ".claude/skills/alpha/SKILL.md",
+            "---\ndescription: Alpha.\n---\n",
+        );
+        // The secret-file rule refuses this path for the "token" in its directory name.
+        h.write(
+            ".claude/skills/token-counter/SKILL.md",
+            "---\ndescription: Counts words.\n---\n",
+        );
+        // A SKILL.md that is a directory cannot be read on any platform.
+        h.mkdir(".claude/skills/odd/SKILL.md");
+        let ctx = h.ctx();
+        let f = ClaudeSkills.run(&ctx, &json!({})).unwrap();
+        let skills = f["tools"]["skills"].as_array().unwrap();
+        assert_eq!(
+            skills[0],
+            json!({ "id": "alpha", "source": "~/.claude/skills/alpha/SKILL.md", "description": "Alpha." })
+        );
+        assert_eq!(
+            skills[1],
+            json!({ "id": "odd", "source": "~/.claude/skills/odd/SKILL.md" })
+        );
+        let warnings = ctx.warnings();
+        assert!(
+            warnings[0].contains("~/.claude/skills/odd/SKILL.md")
+                && warnings[0].ends_with("; skill odd is listed without a description"),
+            "{warnings:?}"
+        );
+        // Whatever the secret-file rule decides for the "token" in the name (a later change
+        // may narrow it to the file name), the importer survives and lists the skill.
+        let token_counter = format!("{}/.claude/skills/token-counter/SKILL.md", h.s());
+        if crate::secrets::is_secret_file(&token_counter) {
+            assert_eq!(
+                skills[2],
+                json!({ "id": "token-counter", "source": "~/.claude/skills/token-counter/SKILL.md" })
+            );
+            assert_eq!(
+                warnings[1],
+                "refused to read secret-looking file ~/.claude/skills/token-counter/SKILL.md; skill token-counter is listed without a description"
+            );
+            assert_eq!(warnings.len(), 2);
+        } else {
+            assert_eq!(skills[2]["description"], json!("Counts words."));
+            assert_eq!(warnings.len(), 1);
+        }
+        assert_eq!(skills.len(), 3);
         assert!(!f.to_string().contains(&h.s()));
     }
 
