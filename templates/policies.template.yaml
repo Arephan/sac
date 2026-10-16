@@ -1,6 +1,6 @@
 # policies.yaml: machine-checkable safety policies. `verify` runs every one against both
 # setup.yaml (desired) and a fresh read of the machine (live). A failing `hard` policy makes
-# verify exit 1. Check reference: docs/policies.md. Custom checks: <instance>/checks/*.mjs.
+# verify exit 1. Check reference: docs/policies.md. Custom checks: executables in <instance>/checks/.
 safety:
   policies:
     - id: no-payment-tools

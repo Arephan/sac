@@ -1,7 +1,7 @@
 # Importers
 
 An importer discovers one part of a setup from the machine and returns a fragment of
-`setup.yaml`. `import`, `plan` and `verify` run all of them (or the list under
+`setup.yaml`. `import`, `plan`, `verify` and `apply` run all of them (or the list under
 `import.importers`), deep-merge the fragments, then merge `overrides.yaml` on top.
 
 ## Built-in importers

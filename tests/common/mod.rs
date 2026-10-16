@@ -106,7 +106,7 @@ pub fn build_home() -> HomeFixture {
     );
     w(
         &home.join(".claude/CLAUDE.md"),
-        "@skills/morning-brief/SKILL.md\n\n## MONEY — HARD RULE (Alex 2026-01-02: \"never spend my money\")\n- No purchases, subscriptions or metered API calls.\n\n## Reply style\nKeep replies short.\n\n## Old lane — SUPERSEDED 2026-02-01\nWas a thing.\n\n## Browser Automation\nAlways use the Playwright CLI.\n",
+        "@skills/morning-brief/SKILL.md\n\n## BUDGET — HARD RULE (Alex 2026-01-02: \"no purchases without a human\")\n- No purchases, subscriptions or metered API calls.\n\n## Reply style\nKeep replies short.\n\n## Old lane — SUPERSEDED 2026-02-01\nWas a thing.\n\n## Browser Automation\nAlways use the Playwright CLI.\n",
     );
 
     let slug: String = h
@@ -117,7 +117,7 @@ pub fn build_home() -> HomeFixture {
     w(&memory_dir.join("MEMORY.md"), "# index\n");
     w(
         &memory_dir.join("feedback_no_spend.md"),
-        "---\nname: feedback_no_spend\ndescription: HARD rule (Alex 2026-01-03) never spend money\nmetadata:\n  type: feedback\n---\n\nNo money leaves any account.\n\n**Why:** a checkout once completed on its own.\n",
+        "---\nname: feedback_no_spend\ndescription: HARD rule (Alex 2026-01-03) purchases need a human click\nmetadata:\n  type: feedback\n---\n\nNo money leaves any account.\n\n**Why:** an unattended checkout is not acceptable.\n",
     );
     w(
         &memory_dir.join("feedback_threads.md"),

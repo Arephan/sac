@@ -1,11 +1,11 @@
 # setup.yaml: the desired state of one person's AI assistant setup.
 #
 # Workflow:
-#   node setup.mjs import  -i <this dir>   # read your machine (read-only) and rewrite this file
-#   node setup.mjs validate -i <this dir>  # schema + cross-reference check
-#   node setup.mjs plan    -i <this dir>   # what differs between this file and your machine (writes nothing)
-#   node setup.mjs verify  -i <this dir>   # drift + safety policies; exits 1 if a hard policy fails
-#   node setup.mjs apply   -i <this dir>   # render config files into <framework>/out/<instance>/ only
+#   sac import   -i <this dir>   # read your machine (read-only) and rewrite this file
+#   sac validate -i <this dir>   # schema + cross-reference check
+#   sac plan     -i <this dir>   # what differs between this file and your machine (writes nothing)
+#   sac verify   -i <this dir>   # drift + safety policies; exits 1 if a hard policy fails
+#   sac apply    -i <this dir>   # render config files into ./out/<instance>/ only
 #
 # Rules of the road:
 #   - Secrets: write WHERE a credential lives (a file path, env var NAME, keychain item), never its value.
@@ -20,7 +20,8 @@ meta:
   owner_role: individual
 
 vars:
-  # Referenced elsewhere as ${vars.NAME}. ${env:NAME} reads an environment variable.
+  # Referenced elsewhere as ${vars.NAME}. ${env:NAME} reads an environment variable, except inside
+  # credential_ref and other secret keys, where it is left as written so no value is ever copied.
   workspace_root: ${env:HOME}/work
 
 import:

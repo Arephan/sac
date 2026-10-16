@@ -8,7 +8,9 @@ Conventions for every layer:
 
 - **ids** are stable, unique within their list, and name a thing by role (`assistant-bot`,
   `outbound-mail`), never by a person.
-- **paths** are `~/...` or `${env:HOME}/...`. `${env:NAME}` and `${vars.NAME}` are expanded at load.
+- **paths** are `~/...` or `${env:HOME}/...`. `${env:NAME}` and `${vars.NAME}` are expanded at load,
+  except inside `credential_ref` and other secret-named keys, which stay as written. Expanded values
+  appear in `out/<instance>/setup.resolved.yaml`, so keep secrets out of `${env:}` entirely.
 - **secrets** appear only as a location: `credential_ref: ~/.bot_token`, `env:API_KEY`,
   `keychain:item-name`, or `env_names: [API_KEY]`. Never a value (see docs/safety.md).
 - Fields not listed below are allowed on most items (notes, extra metadata); `validate` keeps
@@ -153,7 +155,7 @@ data:
 
 ```yaml
 infra:
-  machine: { platform: darwin, arch: arm64, os: "15.0", node: v22.0.0 }
+  machine: { platform: darwin, arch: arm64, os: "15.0" }
   clis:     [{ id: gh, present: true, path: /opt/homebrew/bin/gh }]
   repos:    [{ id: side-project, path: ~/side-project, remote: https://github.com/you/side-project.git }]
   services: [{ id: hosting, tier: free only, account: hosting-token }]

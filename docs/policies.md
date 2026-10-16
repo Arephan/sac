@@ -28,7 +28,7 @@ instructions:
       scope: money
       severity: hard
       date: 2026-01-01
-      reason: An agent once completed a checkout on its own.
+      reason: No purchase may happen without a human click.
       statement: No purchases, subscriptions, top-ups or metered API calls by any agent or loop.
       enforced_by: [no-payment-tools]
 ```

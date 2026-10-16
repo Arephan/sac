@@ -18,9 +18,9 @@ sac lint      prove the shareable parts hold no secrets or personal data
 No runtime, no daemon, no network. Claude Code is the first agent with importers; the manifest
 itself is agent-neutral.
 
-Fast enough to run on every prompt: on a real setup with 216 rules, about 500 memory files, 60
-launchd jobs and 10 MCP servers, `sac import --dry-run` takes 0.1 s warm (0.5 s cold) and
-`verify` 0.3 s, against 1.8 s for the Node prototype it replaced.
+Fast enough to run on every prompt. Measured on the author's laptop (Apple M1 Pro) against a real
+setup with 216 rules, about 500 memory files, 60 launchd jobs and 10 MCP servers: `sac import
+--dry-run` 0.1 s warm, 0.5 s cold; `verify` 0.3 s; the Node prototype took 1.8 s.
 
 ## Why
 
@@ -39,8 +39,8 @@ cargo install --path .            # puts `sac` in ~/.cargo/bin
 # or: scripts/install.sh           # builds and copies to ~/.local/bin
 ```
 
-Release binaries for macOS (Apple silicon and Intel) and Linux x86_64 are attached to each
-GitHub release.
+The release workflow builds macOS (Apple silicon and Intel) and Linux x86_64 binaries for every
+`v*` tag and attaches them to the GitHub release.
 
 ## Ten-minute quickstart
 
@@ -68,8 +68,9 @@ sac verify -i instance/me
 sac apply -i instance/me && ls out/me
 ```
 
-Want to try it without touching your real home? Add `--home /tmp/empty-home` to any import, plan,
-verify or apply command and the importers read that folder instead. `scripts/demo-roundtrip.sh`
+Want to try it without touching your real home? Add `--home /tmp/empty-home` (an existing folder)
+to any import, plan, verify or apply command and the importers read that folder instead. If your
+instance lives outside `./instance/`, pass `--instance-root <dir>` to `lint` so it learns your terms. `scripts/demo-roundtrip.sh`
 does the whole loop in a temp directory: capture home A, rebuild it into empty home B, show that
 B now matches.
 
@@ -91,12 +92,12 @@ are importer options set in the instance.
 
 | command | reads | writes | exit code |
 |---|---|---|---|
-| `init <dir> [--name n] [--force]` | templates | `<dir>/` (refuses to scaffold inside live config) | 1 on clash |
+| `init <dir> [--name n] [--force]` | templates | `<dir>/` (refuses to scaffold inside live config) | 1 on clash or protected dir |
 | `import [-i dir] [--home h] [--dry-run]` | machine (read-only), `overrides.yaml` | `<dir>/setup.yaml` | 1 if the result fails the schema |
 | `validate [-i dir]` | instance | nothing | 1 if invalid |
 | `plan [-i dir] [--home h] [--json] [-v]` | instance + machine | nothing | 0 |
 | `verify [-i dir] [--home h] [--fail-on-drift] [--json]` | instance + machine | nothing | 1 hard failure, 2 drift with the flag |
-| `apply [-i dir] [--out o]` | instance | `<out>/<instance>/` only | 1 if invalid or a hard policy fails |
+| `apply [-i dir] [--out o]` | instance + machine (for the plan in report.md) | `<out>/<instance>/` only | 1 if invalid or a hard policy fails |
 | `apply --live --yes [--home h] [--force]` | instance | the home's live config, after backups | 1 on refusal |
 | `lint [paths...] [--instance-root dir]` | files | nothing | 1 on any finding |
 | `redact -i dir --out d` | instance | `d/setup.yaml`, a shape-only copy | 1 if the result is invalid |
@@ -109,21 +110,24 @@ Instance resolution: `-i`, then `$SAC_INSTANCE`, then `./setup.yaml`, then the o
 
 Rendering to `out/` never touches live config. `--live` additionally merges into a home:
 
-- `~/.claude/settings.json`: managed keys only (`permissions.allow|deny|ask`, `defaultMode`,
-  `deniedMcpServers`, `hooks`, `enabledPlugins`, `model`, `effortLevel`). Every other key and
-  every `env` value is kept.
+- `~/.claude/settings.json`: `permissions.allow|deny|ask`, `defaultMode`, `enabledPlugins`,
+  `model` and `effortLevel` come from the manifest. `hooks` and `deniedMcpServers` are written only
+  when the file lacks them or with `--force`, because the manifest keeps just a hook's command and
+  a denial's name. Every other key and every `env` value is kept.
 - `~/.claude.json`: missing MCP servers are added. An existing server keeps its `env` and
   `headers` values; its command, args and URL change only with `--force`. Denied or disabled
   servers are never added.
 - `~/Library/LaunchAgents/<label>.plist` for every managed launchd loop with a program: written
-  when missing, overwritten only with `--force`; disabled loops go under `disabled/`. Nothing is
-  ever loaded. The `launchctl bootstrap` commands are printed for you to run.
+  when missing, regenerated from the manifest only with `--force` (keys the manifest does not
+  carry are dropped then); disabled loops go under `disabled/`. Nothing is ever loaded. The
+  `launchctl bootstrap` commands are printed for you to run.
 - `~/.claude/setup-as-code/RULES.md`, `setup.lock.json`, `report.md`.
 - Before the first write, every file that will change is copied to
   `~/.setup-as-code/backups/<timestamp>/`.
 
 Skills, memory files and plugin installs are things the manifest points at, not things it can
-recreate; they stay where they are.
+recreate; they stay where they are. A file whose content would contain `<redacted>` is skipped
+and reported. Quit Claude Code before a live run; it writes `~/.claude.json` itself.
 
 ## Plugins: importers and checks in any language
 
@@ -140,10 +144,11 @@ fragment of `setup.yaml`). A check answers `describe` (`{"id","doc"}`) and `run`
 Enforced in code and covered by tests, not just promised:
 
 - Importers see the machine only through a context that refuses to open secret-looking files
-  (`*token*`, `*_key`, `.env`, `auth.json`, keys, cookies) and runs only allowlisted read-only
-  commands (`launchctl list|print-disabled`, `crontab -l`, `sw_vers`, `uname`, `git remote|log`).
-  There is no load, unload, bootstrap or kill anywhere in the binary.
-- Env vars and HTTP headers are imported as names only. Secret-shaped strings are dropped.
+  (`*token*`, `*secret*`, `*_key`, `.env`, `auth.json`, keys, cookies) and runs only `launchctl
+  list|print-disabled`, `crontab -l`, `sw_vers` and `uname`; launchd plists and `.git/config` are
+  parsed in-process. There is no load, unload, bootstrap or kill anywhere in the binary.
+- Env vars and HTTP headers are imported as names only. Secret-shaped strings are dropped, and
+  `${env:NAME}` is never expanded inside a key that names a credential.
 - `apply` without `--live` writes only below the out root and refuses an out root inside
   `~/.claude`, `~/Library/LaunchAgents` or other live config.
 - Nothing calls a paid API, posts to a chat or sends email.
@@ -151,7 +156,7 @@ Enforced in code and covered by tests, not just promised:
   any email, phone number, home path or chat id appears in the shareable tree.
 
 `scripts/parity.sh` compares imports against the Node prototype this binary replaced (tag
-`v0.2.0`); all thirty collections agreed on the last run. `cargo test` runs the unit suite plus end-to-end tests over a synthetic home: import counts,
+`v0.2.0`); all thirty collections agreed on the synthetic home used by the test suite. `cargo test` runs the unit suite plus end-to-end tests over a synthetic home: import counts,
 drift detection, exit codes, rendered plists checked with `plutil -lint`, the lint against
 planted canaries, and a full round trip through `apply --live` into an empty home.
 
@@ -182,6 +187,7 @@ instance/                    your data (git-ignored)
 - [docs/importers.md](docs/importers.md): built-in importers and the plugin protocol
 - [docs/policies.md](docs/policies.md): hard vs standing rules, policy checks, custom checks
 - [docs/safety.md](docs/safety.md): secrets, the lint, what is never touched
+- [docs/design.md](docs/design.md): how it is built, the safety contract in detail, differences from the prototype
 
 ## Status
 

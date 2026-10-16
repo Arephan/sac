@@ -5,3 +5,4 @@ instance/*
 target/
 .superpowers/
 .worktrees/
+docs/superpowers/

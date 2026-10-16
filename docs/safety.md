@@ -7,9 +7,10 @@
   `~/Library/LaunchDaemons`, `/Library`, `/etc` or systemd user units. `apply` writes only below
   the out root and checks its resolved real path before every write; symlinks planted inside it
   are refused.
-- Never loads, unloads, bootstraps, kicks or kills a job. The launchd importer parses plists
-  in-process and runs only `launchctl list` and `launchctl print-disabled`. `apply --live` writes
-  plist files and prints the `launchctl bootstrap` commands; it never runs them.
+- Never loads, unloads, bootstraps, kicks or kills a job. The only commands the binary ever runs
+  are `launchctl list`, `launchctl print-disabled`, `crontab -l`, `sw_vers` and `uname` (plus the
+  plugins you install). Launchd plists and `.git/config` are parsed in-process. `apply --live`
+  writes plist files and prints the `launchctl bootstrap` commands; it never runs them.
 - Never opens a file whose name looks like a credential, and never keeps an env var or header
   value: those become `env_names` / `header_names`.
 - Never calls a network API, a paid service, a chat platform or a mail server.
@@ -19,8 +20,9 @@
 The one command that writes into a home. It needs `--yes`. Before the first write it copies every
 file it is about to change to `~/.setup-as-code/backups/<UTC timestamp>/`. It merges, it does not
 replace: `settings.json` keeps every key the manifest does not manage and every `env` value;
-`~/.claude.json` keeps each existing server's `env` and `headers`; plists are only written when
-missing unless `--force`. It refuses to touch a `settings.json` or `.claude.json` that is not valid
+`~/.claude.json` keeps each existing server's `env` and `headers`; plists, `hooks` and
+`deniedMcpServers` are only written when missing unless `--force`, because the manifest's model
+of them is lossy and `--force` regenerates them. It refuses to touch a `settings.json` or `.claude.json` that is not valid
 JSON, so a half-written file is never silently overwritten. Point it at a sandbox with `--home`
 to see exactly what it would do.
 
@@ -45,8 +47,8 @@ Three layers of defence:
 
 ## The lint: keeping the framework person-free
 
-`sac lint` scans the working directory (skipping `target/`, `node_modules/`, `out/`, `.git/` and
-`instance/`), or the paths you give it, for:
+`sac lint` scans the working directory (skipping `target/`, `node_modules/`, `out/`, `.git/`,
+`instance/`, `.superpowers/` and `.worktrees/`), or the paths you give it, for:
 
 - secret-shaped strings (same detectors as above);
 - email addresses outside `example.com/org/net`;

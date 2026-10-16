@@ -124,10 +124,10 @@ fn import_reads_the_whole_home() {
     // instructions: 4 CLAUDE.md sections + 2 memory feedback files
     let rules = ids(&d, "instructions.rules");
     assert_eq!(rules.len(), 6, "{rules:?}");
-    let money = find(&d, "instructions.rules", "md-money");
+    let money = find(&d, "instructions.rules", "md-budget");
     assert_eq!(money["severity"], "hard");
     assert_eq!(money["date"], "2026-01-02");
-    assert_eq!(money["reason"], "never spend my money");
+    assert_eq!(money["reason"], "no purchases without a human");
     assert_eq!(
         find(&d, "instructions.rules", "md-old-lane")["status"],
         "superseded"
@@ -138,7 +138,7 @@ fn import_reads_the_whole_home() {
     );
     assert_eq!(
         find(&d, "instructions.rules", "mem-feedback_no_spend")["reason"],
-        "a checkout once completed on its own."
+        "an unattended checkout is not acceptable."
     );
     let sources = ids(&d, "instructions.sources");
     assert!(
@@ -402,7 +402,7 @@ fn apply_renders_files_and_plists() {
     }
     let rules = fs::read_to_string(od.join("claude/RULES.md")).unwrap();
     assert!(
-        rules.contains("## Hard rules") && rules.contains("md-money"),
+        rules.contains("## Hard rules") && rules.contains("md-budget"),
         "{rules}"
     );
     let lock: Value =
@@ -697,8 +697,22 @@ fn dump_fixture_for_scripts() {
     let root = fx.tmp.path();
     let inst = init_instance(root, "alex");
     // the memory dir slug depends on the final home path, so rebuild it under the destination
+    // never delete a directory this test did not write: refuse unless absent, empty, or ours
+    if out.exists() {
+        let ours = out.join("instance/alex").is_dir() && out.join("home-alex").is_dir();
+        let empty = fs::read_dir(&out)
+            .map(|mut d| d.next().is_none())
+            .unwrap_or(false);
+        assert!(
+            ours || empty,
+            "SAC_FIXTURE_OUT {} exists and is not a fixture dir",
+            out.display()
+        );
+        if ours {
+            fs::remove_dir_all(&out).unwrap();
+        }
+    }
     let dest_home = out.join("home-alex");
-    let _ = fs::remove_dir_all(&out);
     common::copy_tree(&fx.home, &dest_home);
     let dest_home = dest_home.canonicalize().unwrap();
     let slug: String = dest_home

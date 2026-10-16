@@ -56,7 +56,7 @@ instructions:
       scope: chat
       severity: hard
       date: 2026-01-01
-      reason: A personal design once leaked into a work channel.
+      reason: Work and personal accounts stay separate.
       enforced_by: [block-work-chat, chat-posts-as-bot]
     - id: reply-in-thread
       scope: chat
