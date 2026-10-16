@@ -152,6 +152,15 @@ and `crontab -l` are spawned, once each, and only for the real home.
 - Plugin timeouts (20 s) kill the plugin process, not its process group: a wrapper script must
   `exec` its worker and must not leave children holding stdout.
 - Cron loop ids are, as in the reference, a slug of the raw command line.
+- Policy check parameters: a list parameter given as a single scalar counts as a one-item list
+  (the reference iterated the characters of the string); a list parameter set to null fails the
+  check closed with a `check crashed:` message, as the reference did by crashing.
+- External checks must exit 0 after printing their result. A non-zero exit, a timeout or output
+  that is not a JSON object is reported as `check crashed: ...`, even when stdout held a result.
+  `describe` is subject to the same 20 s limit. Plugins are unix-only for now.
+- `render` resolves protected paths under both the given home and the real home; its unit
+  tests therefore read real-home metadata (never contents). On a case-insensitive volume, a not
+  yet existing case variant of a protected path is created before it is refused.
 
 ## Safety contract (unchanged, enforced in code and tests)
 

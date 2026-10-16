@@ -104,6 +104,7 @@ elif cmd == "run":
 ```
 
 Then reference it: `{ id: few-loops, check: max_enabled_loops, severity: standing, params: { max: 5 } }`.
-A crash, a timeout or malformed output counts as a failed check with a `check crashed:` message.
+A check must print its result and exit 0; a non-zero exit, a timeout (20 s) or output that is not a JSON
+object counts as a failed check with a `check crashed:` message, even if a result was printed.
 Keep checks pure: they get the whole setup object and must not touch the machine. A working copy
 lives in `examples/minimal/checks/max-enabled-loops`.
