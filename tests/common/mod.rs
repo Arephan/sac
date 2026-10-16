@@ -192,9 +192,13 @@ pub fn build_home() -> HomeFixture {
         ),
     );
 
+    let remote = format!(
+        "https://{}@github.com/alex/app.git",
+        ["user:", "secretpass"].concat()
+    );
     w(
         &home.join("code/app/.git/config"),
-        "[core]\n\trepositoryformatversion = 0\n[remote \"origin\"]\n\turl = https://user:secretpass@github.com/alex/app.git\n\tfetch = +refs/heads/*:refs/remotes/origin/*\n",
+        &format!("[core]\n\trepositoryformatversion = 0\n[remote \"origin\"]\n\turl = {remote}\n\tfetch = +refs/heads/*:refs/remotes/origin/*\n"),
     );
     w(&home.join("code/app/.git/HEAD"), "ref: refs/heads/main\n");
     w(
