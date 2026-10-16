@@ -453,7 +453,7 @@ fn run() -> Result<i32> {
                 println!("  wrote {f}");
             }
             for f in &lr.skipped {
-                println!("  kept  {f}");
+                println!("  skipped {f}");
             }
             if let Some(b) = &lr.backup_dir {
                 println!("  backups: {}", b.display());
