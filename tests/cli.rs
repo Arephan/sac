@@ -674,3 +674,39 @@ fn round_trip_apply_live_into_an_empty_home() {
     );
     assert!(again.stdout.contains("backups:"), "{}", again.stdout);
 }
+
+/// Not a test of behaviour: with SAC_FIXTURE_OUT set, writes the synthetic home and a ready
+/// instance there so shell scripts (scripts/parity.sh) can use the same fixture.
+/// Run: SAC_FIXTURE_OUT=/tmp/sac-fixture cargo test --test cli dump_fixture -- --ignored
+#[test]
+#[ignore]
+fn dump_fixture_for_scripts() {
+    let Some(out) = std::env::var_os("SAC_FIXTURE_OUT") else {
+        return;
+    };
+    let out = std::path::PathBuf::from(out);
+    let fx = build_home();
+    let root = fx.tmp.path();
+    let inst = init_instance(root, "alex");
+    // the memory dir slug depends on the final home path, so rebuild it under the destination
+    let dest_home = out.join("home-alex");
+    let _ = fs::remove_dir_all(&out);
+    common::copy_tree(&fx.home, &dest_home);
+    let dest_home = dest_home.canonicalize().unwrap();
+    let slug: String = dest_home
+        .to_string_lossy()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    let new_mem = dest_home.join(".claude/projects").join(slug).join("memory");
+    fs::create_dir_all(new_mem.parent().unwrap()).unwrap();
+    let old_mem = dest_home
+        .join(".claude/projects")
+        .join(fx.memory_dir.parent().unwrap().file_name().unwrap())
+        .join("memory");
+    if old_mem != new_mem {
+        fs::rename(&old_mem, &new_mem).unwrap();
+    }
+    common::copy_tree(&inst, &out.join("instance/alex"));
+    eprintln!("fixture written to {}", out.display());
+}

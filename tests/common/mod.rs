@@ -295,3 +295,17 @@ pub fn init_instance(root: &Path, name: &str) -> PathBuf {
     fs::write(inst.join("overrides.yaml"), overrides_yaml()).unwrap();
     inst
 }
+
+/// Recursive copy, used to materialise the fixture for scripts (parity, demos).
+pub fn copy_tree(from: &Path, to: &Path) {
+    fs::create_dir_all(to).unwrap();
+    for e in fs::read_dir(from).unwrap() {
+        let e = e.unwrap();
+        let dest = to.join(e.file_name());
+        if e.path().is_dir() {
+            copy_tree(&e.path(), &dest);
+        } else {
+            fs::copy(e.path(), &dest).unwrap();
+        }
+    }
+}
