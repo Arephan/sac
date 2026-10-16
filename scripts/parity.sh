@@ -8,10 +8,19 @@ SAC="${SAC:-./target/release/sac}"; [ -x "$SAC" ] || SAC="./target/debug/sac"
 work="$(mktemp -d)"; trap 'rm -rf "$work"' EXIT
 cp -R "$INST" "$work/rs"; cp -R "$INST" "$work/js"
 "$SAC" import -i "$work/rs" --home "$HOME_DIR" >/dev/null
-node setup.mjs import -i "$work/js" --home "$HOME_DIR" >/dev/null
-node --input-type=module - "$work/rs/setup.yaml" "$work/js/setup.yaml" <<'JS'
+# The Node prototype lives at tag v0.2.0. Use a checkout of it when this tree no longer has it.
+REF="."
+if [ ! -f setup.mjs ]; then
+  REF="$work/ref"
+  git worktree add -q "$REF" v0.2.0
+  trap 'git worktree remove --force "$REF" 2>/dev/null; rm -rf "$work"' EXIT
+  (cd "$REF" && npm install --silent --no-audit --no-fund >/dev/null)
+fi
+(cd "$REF" && node setup.mjs import -i "$work/js" --home "$HOME_DIR" >/dev/null)
+NODE_PATH="$REF/node_modules" node --input-type=module - "$work/rs/setup.yaml" "$work/js/setup.yaml" <<'JS'
 import fs from 'node:fs';
-import YAML from 'yaml';
+import { createRequire } from 'node:module';
+const YAML = createRequire(process.env.NODE_PATH + '/')('yaml');
 const [rsFile, jsFile] = process.argv.slice(2);
 const rs = YAML.parse(fs.readFileSync(rsFile, 'utf8'));
 const js = YAML.parse(fs.readFileSync(jsFile, 'utf8'));

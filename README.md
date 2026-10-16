@@ -18,6 +18,10 @@ sac lint      prove the shareable parts hold no secrets or personal data
 No runtime, no daemon, no network. Claude Code is the first agent with importers; the manifest
 itself is agent-neutral.
 
+Fast enough to run on every prompt: on a real setup with 216 rules, about 500 memory files, 60
+launchd jobs and 10 MCP servers, `sac import --dry-run` takes 0.1 s warm (0.5 s cold) and
+`verify` 0.3 s, against 1.8 s for the Node prototype it replaced.
+
 ## Why
 
 Everyone who runs an assistant for real ends up with a pile of `CLAUDE.md` files, hooks, skills,
@@ -146,7 +150,8 @@ Enforced in code and covered by tests, not just promised:
 - `sac lint` fails if any term from your instance (names, handles, workspaces, the home user),
   any email, phone number, home path or chat id appears in the shareable tree.
 
-`cargo test` runs the unit suite plus end-to-end tests over a synthetic home: import counts,
+`scripts/parity.sh` compares imports against the Node prototype this binary replaced (tag
+`v0.2.0`); all thirty collections agreed on the last run. `cargo test` runs the unit suite plus end-to-end tests over a synthetic home: import counts,
 drift detection, exit codes, rendered plists checked with `plutil -lint`, the lint against
 planted canaries, and a full round trip through `apply --live` into an empty home.
 
