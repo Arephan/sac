@@ -1,7 +1,7 @@
 //! Render config files from the desired state into `<out_root>/<instance>/` and nowhere else.
 //! Nothing is installed, loaded, enabled or sent; a person copies what they want from there.
 //!
-//! Ported from the reference `framework/lib/apply.mjs`: the same file set, JSON shapes, plist
+//! Ported from the Node prototype (tag v0.2.0): the same file set, JSON shapes, plist
 //! layout, `RULES.md` layout, lock fields and report sections. Where the reference relies on
 //! JavaScript coercion (`String(x)`, `Number(x)`, truthiness), the helpers below reproduce it so
 //! hand-written manifests render the same way in both implementations.
@@ -951,7 +951,7 @@ pub(crate) mod tests {
         render_in(d, out_root, home, &real, policy, plan)
     }
 
-    // Expected outputs below were produced by the reference framework/lib/apply.mjs on the
+    // Expected outputs below were produced by the Node prototype (tag v0.2.0) on the
     // same fixture.
 
     #[test]

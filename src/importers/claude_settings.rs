@@ -1,7 +1,7 @@
 //! Importer `claude-settings`: Claude Code user settings (model and effort, permissions, denied
 //! MCP servers, hooks, enabled plugins) from `~/.claude/settings.json` and
 //! `~/.claude/settings.local.json`. Env var values are dropped; only their names are kept.
-//! Ported from the reference `framework/importers/claude-settings.mjs`.
+//! Ported from the Node prototype (tag v0.2.0).
 
 use super::rules::{entries, js_order, js_string, key_list, present, truthy};
 use super::Importer;
@@ -62,9 +62,10 @@ fn home_rule_paths(rule: &str, home: &str) -> String {
         let start = from + offset;
         let end = start + needle.len();
         // `map_or(true, ..)` rather than `is_none_or`, which is newer than the crate's MSRV
-        let bounded = rule[end..].chars().next().map_or(true, |c| {
-            matches!(c, '/' | ')' | '"' | '\'') || c.is_whitespace()
-        });
+        let bounded = rule[end..]
+            .chars()
+            .next()
+            .is_none_or(|c| matches!(c, '/' | ')' | '"' | '\'') || c.is_whitespace());
         if bounded && !rule[..start].ends_with('/') {
             out.push_str(&rule[copied..start]);
             out.push('~');

@@ -1,5 +1,5 @@
 //! Path, string and document helpers shared by every module. Ported from the reference
-//! `framework/lib/util.mjs`; semantics (deep merge by id, stable stringify, slug) are kept exact
+//! the reference at tag v0.2.0; semantics (deep merge by id, stable stringify, slug) are kept exact
 //! so that manifests written by either implementation diff cleanly.
 
 use crate::Doc;
@@ -98,36 +98,54 @@ pub fn slug(s: &str, max: usize) -> String {
     }
 }
 
-/// Expand `${env:NAME}` and `${vars.NAME}` in every string of a document.
+/// Expand `${env:NAME}` and `${vars.NAME}` in every string of a document. Keys that name a
+/// credential (`credential_ref`, `env`, `headers`, `token`, ...) are left unexpanded, so a
+/// secret can never be copied out of the environment into a rendered file.
 pub fn resolve_vars(v: &Doc, vars: &Doc) -> Doc {
-    fn sub(s: &str, vars: &Doc) -> String {
+    fn env_re() -> &'static Regex {
+        static R: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+        R.get_or_init(|| Regex::new(r"\$\{env:([A-Za-z_][A-Za-z0-9_]*)\}").unwrap())
+    }
+    fn var_re() -> &'static Regex {
+        static R: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+        R.get_or_init(|| Regex::new(r"\$\{vars\.([A-Za-z_][A-Za-z0-9_]*)\}").unwrap())
+    }
+    fn sub(s: &str, vars: &Doc, expand_env: bool) -> String {
+        if !s.contains("${") {
+            return s.to_string();
+        }
         let mut out = s.to_string();
-        let env_re = Regex::new(r"\$\{env:([A-Za-z_][A-Za-z0-9_]*)\}").unwrap();
-        out = env_re
-            .replace_all(&out, |c: &regex::Captures| {
-                std::env::var(&c[1]).unwrap_or_default()
-            })
-            .into_owned();
-        let var_re = Regex::new(r"\$\{vars\.([A-Za-z_][A-Za-z0-9_]*)\}").unwrap();
-        out = var_re
+        if expand_env {
+            out = env_re()
+                .replace_all(&out, |c: &regex::Captures| {
+                    std::env::var(&c[1]).unwrap_or_default()
+                })
+                .into_owned();
+        }
+        var_re()
             .replace_all(&out, |c: &regex::Captures| match vars.get(&c[1]) {
                 Some(Value::String(x)) => x.clone(),
                 Some(Value::Null) | None => String::new(),
                 Some(other) => other.to_string(),
             })
-            .into_owned();
-        out
+            .into_owned()
     }
-    match v {
-        Value::String(s) => Value::String(sub(s, vars)),
-        Value::Array(a) => Value::Array(a.iter().map(|x| resolve_vars(x, vars)).collect()),
-        Value::Object(o) => Value::Object(
-            o.iter()
-                .map(|(k, x)| (k.clone(), resolve_vars(x, vars)))
-                .collect(),
-        ),
-        other => other.clone(),
+    fn walk(v: &Doc, vars: &Doc, key: Option<&str>) -> Doc {
+        let secret_key = key
+            .map(|k| k == "credential_ref" || crate::secrets::is_secret_key(k))
+            .unwrap_or(false);
+        match v {
+            Value::String(s) => Value::String(sub(s, vars, !secret_key)),
+            Value::Array(a) => Value::Array(a.iter().map(|x| walk(x, vars, key)).collect()),
+            Value::Object(o) => Value::Object(
+                o.iter()
+                    .map(|(k, x)| (k.clone(), walk(x, vars, Some(k))))
+                    .collect(),
+            ),
+            other => other.clone(),
+        }
     }
+    walk(v, vars, None)
 }
 
 /// Follow a dotted path through objects.

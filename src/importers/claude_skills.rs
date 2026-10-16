@@ -1,5 +1,5 @@
 //! Importer `claude-skills`: user skills (`~/.claude/skills/<name>/SKILL.md`) and slash
-//! commands (`~/.claude/commands/*.md`). Ported from `framework/importers/claude-skills.mjs`.
+//! commands (`~/.claude/commands/*.md`). Ported from the Node prototype (tag v0.2.0).
 
 use super::rules::{js_shown, js_slice, js_string, scrub_text, static_re, truthy};
 use super::Importer;

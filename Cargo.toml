@@ -2,7 +2,7 @@
 name = "setup-as-code"
 version = "0.3.0"
 edition = "2021"
-rust-version = "1.80"
+rust-version = "1.88"
 description = "Terraform for a personal AI assistant: one YAML manifest for identities, models, rules, tools, loops and safety policies. import, plan, verify, apply, lint."
 license = "MIT"
 repository = "https://github.com/Arephan/setup-as-code"

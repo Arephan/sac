@@ -1,4 +1,4 @@
-//! The nine built-in policy checks, ported from the reference `framework/policy/checks.mjs`.
+//! The nine built-in policy checks, ported from the Node prototype (tag v0.2.0).
 //!
 //! Every check is pure: it reads the setup document and its params and never touches the
 //! machine. Ids, docs, messages, evidence strings and the pass/warn/fail rules match the

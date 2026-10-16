@@ -40,14 +40,6 @@ fn allowed(cmd: &str, args: &[&str]) -> bool {
         "launchctl" => matches!(a(0), "list" | "print-disabled"),
         "crontab" => args.len() == 1 && a(0) == "-l",
         "sw_vers" | "uname" => true,
-        "git" => {
-            a(0) == "-C"
-                && matches!(a(2), "remote" | "rev-parse" | "log")
-                && !args
-                    .iter()
-                    .any(|x| matches!(*x, "set-url" | "add" | "remove"))
-        }
-        "systemctl" => a(0) == "--user" && matches!(a(1), "list-timers" | "list-unit-files"),
         _ => false,
     }
 }
@@ -275,12 +267,12 @@ mod tests {
         assert!(ctx.exec("launchctl", &["load", "x"]).is_err());
         assert!(ctx.exec("rm", &["-rf", "/"]).is_err());
         assert!(ctx
-            .exec("git", &["-C", "/tmp", "remote", "set-url", "x"])
+            .exec("git", &["-C", "/tmp", "remote", "get-url", "origin"])
             .is_err());
-        assert!(allowed(
-            "git",
-            &["-C", "/tmp", "remote", "get-url", "origin"]
-        ));
+        assert!(allowed("launchctl", &["list"]));
+        assert!(!allowed("launchctl", &["bootstrap", "gui/501", "x.plist"]));
+        assert!(allowed("crontab", &["-l"]));
+        assert!(!allowed("crontab", &["-r"]));
     }
 
     #[test]

@@ -7,7 +7,7 @@
 //! - user      -> `identity.person.profile_refs` (file paths only, contents never copied)
 //!
 //! The memory folder is found from the home directory, so nothing about the person is
-//! hardcoded. Ported from `framework/importers/claude-memory.mjs`.
+//! hardcoded. Ported from the Node prototype (tag v0.2.0).
 
 use super::rules::{
     classify_scope, first_date, js_order, js_p, js_shown, js_slice, js_string, scrub_text,

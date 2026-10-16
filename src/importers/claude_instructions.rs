@@ -1,6 +1,6 @@
 //! Importer `claude-instructions`: the global `~/.claude/CLAUDE.md`. Each `## ` section becomes
 //! a rule; each `@path` import line becomes a source (the imported file is not read).
-//! Ported from `framework/importers/claude-instructions.mjs`.
+//! Ported from the Node prototype (tag v0.2.0).
 
 use super::rules::{
     classify_scope, first_date, js_shown, js_slice, scrub_text, severity_of, static_re,

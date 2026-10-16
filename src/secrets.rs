@@ -63,7 +63,10 @@ fn secret_file_re() -> &'static Regex {
     })
 }
 
-/// True when a path's final component looks like it holds a credential.
+/// True when a path looks like it holds a credential. The check runs over the whole path on
+/// purpose (`.*token.*` and `.*secret.*` span directories), so a file inside a folder named
+/// after a secret is refused as well; importers that must read a known-safe file (launchd
+/// plists, `.git/config`) read it directly instead.
 pub fn is_secret_file(path: &str) -> bool {
     secret_file_re().is_match(path)
 }

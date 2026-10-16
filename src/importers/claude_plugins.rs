@@ -1,6 +1,6 @@
 //! Importer `claude-plugins`: installed Claude Code plugins from
 //! `~/.claude/plugins/installed_plugins.json`. Enabled flags come from `claude-settings`.
-//! Ported from `framework/importers/claude-plugins.mjs`.
+//! Ported from the Node prototype (tag v0.2.0).
 
 use super::rules::{entries, js_order, js_string, truthy};
 use super::Importer;

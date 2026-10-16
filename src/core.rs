@@ -58,7 +58,12 @@ pub fn resolve_instance(flag: Option<&str>, cwd: &Path) -> Result<Instance> {
     let Some(dir) = cands.into_iter().next() else {
         bail!("no instance found: pass --instance <dir> (a folder holding setup.yaml), or run `init <dir>` first");
     };
-    if dir.extension().map(|e| e == "yaml").unwrap_or(false) && dir.is_file() {
+    if dir
+        .extension()
+        .map(|e| e == "yaml" || e == "yml")
+        .unwrap_or(false)
+        && dir.is_file()
+    {
         let parent = dir
             .parent()
             .map(|p| p.to_path_buf())
@@ -109,7 +114,29 @@ pub fn desired_state(loaded: &Loaded) -> Doc {
         .map(|s| json!({ "safety": s }));
     let merged = deep_merge(Some(&loaded.setup), pol.as_ref());
     let vars = merged.get("vars").cloned().unwrap_or(json!({}));
-    normalize(resolve_vars(&merged, &vars))
+    normalize(redact_secret_values(resolve_vars(&merged, &vars)))
+}
+
+/// Replace any secret-shaped string in a document with `<redacted>`. The desired state is
+/// rendered into out/ and merged into live config, so a value that looks like a credential
+/// must never travel with it.
+fn redact_secret_values(v: Doc) -> Doc {
+    match v {
+        Value::String(s) => {
+            if crate::secrets::find_secrets(&s).is_empty() {
+                Value::String(s)
+            } else {
+                Value::String("<redacted>".to_string())
+            }
+        }
+        Value::Array(a) => Value::Array(a.into_iter().map(redact_secret_values).collect()),
+        Value::Object(o) => Value::Object(
+            o.into_iter()
+                .map(|(k, x)| (k, redact_secret_values(x)))
+                .collect(),
+        ),
+        other => other,
+    }
 }
 
 /// Collection and scalar paths a fragment actually returned (even when empty).
@@ -258,12 +285,23 @@ pub fn import_live(a: ImportArgs) -> Result<ImportResult> {
             }
         }
     }
+    // Hand-declared objects under these four layers survive an import: a scalar object no
+    // importer observed (identity.person, brain.budgets, ...) is deep-merged under what the
+    // importers found, so `profile_refs` from memory never wipes `role` or `timezone`.
     for k in ["identity", "brain", "data", "infra"] {
         if let Some(Value::Object(o)) = a.baseline.get(k) {
             for (kk, v) in o {
                 let path = format!("{k}.{kk}");
-                if get_path(&live, &path).is_none() && !v.is_array() {
-                    set_path(&mut live, &path, v.clone());
+                if v.is_array() || observed.contains(path.as_str()) {
+                    continue;
+                }
+                match (v, get_path(&live, &path)) {
+                    (Value::Object(_), Some(found @ Value::Object(_))) => {
+                        let merged = deep_merge(Some(v), Some(found));
+                        set_path(&mut live, &path, merged);
+                    }
+                    (_, None) => set_path(&mut live, &path, v.clone()),
+                    _ => {}
                 }
             }
         }
@@ -444,5 +482,15 @@ mod tests {
         let d = desired_state(&loaded);
         assert_eq!(d["projects"][0]["path"], json!("/r/p"));
         assert_eq!(d["safety"]["policies"][0]["id"], json!("a"));
+        let tok = ["xoxb-", "1234567890-abcdefghij"].concat();
+        let leaky = Loaded {
+            setup: json!({ "version": 1, "meta": { "instance": "x" }, "identity": { "accounts": [{ "id": "a", "kind": "k", "access": "read_only", "note": tok }] } }),
+            overrides: json!({}),
+            policies: json!({}),
+        };
+        assert_eq!(
+            desired_state(&leaky)["identity"]["accounts"][0]["note"],
+            json!("<redacted>")
+        );
     }
 }

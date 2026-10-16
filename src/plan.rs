@@ -1,5 +1,5 @@
 //! Desired vs live diff by layer collection. Pure: reads two documents, writes nothing.
-//! Ported from the reference `framework/lib/plan.mjs`: keyed collections diff by id, plain
+//! Ported from the Node prototype (tag v0.2.0): keyed collections diff by id, plain
 //! lists diff as string sets, scalar objects diff field by field.
 
 use crate::layers::LAYERS;

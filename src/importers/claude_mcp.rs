@@ -1,6 +1,6 @@
 //! Importer `claude-mcp`: MCP servers from every place Claude Code reads them, `~/.claude.json`
 //! (user and per-project) and `~/.claude/mcp.json`. Only the command/url/args shape and the
-//! NAMES of env vars and headers are kept. Ported from `framework/importers/claude-mcp.mjs`.
+//! NAMES of env vars and headers are kept. Ported from the Node prototype (tag v0.2.0).
 
 use super::rules::{entries, js_order, js_string, key_list, static_re, truthy};
 use super::Importer;

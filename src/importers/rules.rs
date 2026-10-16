@@ -1,5 +1,5 @@
 //! Turning free-text instructions into structured rules: scope, severity, date. Ported from
-//! the reference `framework/lib/rules.mjs`. The keyword table is generic; an instance extends
+//! the Node prototype (tag v0.2.0). The keyword table is generic; an instance extends
 //! it through `import.options.<importer>.scope_keywords: { scope: [words...] }`.
 //!
 //! Also home to the small JavaScript-compatibility helpers the Claude importers share, so that

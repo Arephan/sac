@@ -1,7 +1,7 @@
 //! Shape-only copy of a setup: layers, counts, kinds, severities, scopes, schedules and on/off
 //! flags survive; every free-text value is dropped. Safe by construction: only allowlisted
 //! enum-like fields are copied and ids become placeholders. Ported from the reference
-//! `framework/lib/redact.mjs`.
+//! the Node prototype (tag v0.2.0).
 
 use crate::layers::LAYERS;
 use crate::plan::js_display;
@@ -164,7 +164,7 @@ fn redact_schedule(s: &Doc) -> Doc {
 
 /// JavaScript `r[k] ??= v`: set when missing or null, keeping an existing key's position.
 fn default_to(r: &mut Map<String, Value>, k: &str, v: Value) {
-    if r.get(k).map_or(true, Value::is_null) {
+    if r.get(k).is_none_or(Value::is_null) {
         r.insert(k.to_string(), v);
     }
 }

@@ -1,5 +1,5 @@
 //! Scaffold a new person's instance folder from the commented templates in `templates/`.
-//! Ported from the reference `framework/lib/init.mjs`.
+//! Ported from the Node prototype (tag v0.2.0).
 
 use crate::util::{expand_home, slug};
 use anyhow::{bail, Context, Result};

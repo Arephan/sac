@@ -1,5 +1,5 @@
 //! Secret and personal-data lint over everything meant to be shareable (sources, examples,
-//! docs). Ported from the reference `framework/lib/lint.mjs`.
+//! docs). Ported from the Node prototype (tag v0.2.0).
 //!
 //! Two kinds of detectors:
 //!  1. Generic: secret-shaped strings, real-looking emails, phone numbers, user home paths,
@@ -371,7 +371,7 @@ fn phone_body(cs: &[char], i: usize) -> Option<usize> {
 /// The reference PHONE_RE anchored at `i`, alternatives in backtracking order, with the
 /// `(?![\w-])` lookahead checked at the end.
 fn phone_at(cs: &[char], i: usize) -> Option<usize> {
-    let end_ok = |e: usize| cs.get(e).map_or(true, |&c| !(is_word(c) || c == '-'));
+    let end_ok = |e: usize| cs.get(e).is_none_or(|&c| !(is_word(c) || c == '-'));
     // Optional `\+?\d{1,2}[\s.-]` prefix: two digits, then one.
     let j = if cs.get(i) == Some(&'+') { i + 1 } else { i };
     for n in [2, 1] {
@@ -416,11 +416,11 @@ fn term_hit(re: &Regex, line: &str) -> bool {
         let before_ok = line[..m.start()]
             .chars()
             .next_back()
-            .map_or(true, |c| !c.is_ascii_alphanumeric());
+            .is_none_or(|c| !c.is_ascii_alphanumeric());
         let after_ok = line[m.end()..]
             .chars()
             .next()
-            .map_or(true, |c| !c.is_ascii_alphanumeric());
+            .is_none_or(|c| !c.is_ascii_alphanumeric());
         if before_ok && after_ok {
             return true;
         }
