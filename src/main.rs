@@ -327,13 +327,12 @@ fn run() -> Result<i32> {
                 "{}",
                 paint_statuses(&format_policy_results(&pl, cli.verbose))
             );
-            let mut hard: Vec<String> = pd
-                .hard_fails()
-                .iter()
-                .chain(pl.hard_fails().iter())
-                .map(|r| r.id.clone())
-                .collect();
-            hard.dedup();
+            let mut hard: Vec<String> = Vec::new();
+            for r in pd.hard_fails().iter().chain(pl.hard_fails().iter()) {
+                if !hard.contains(&r.id) {
+                    hard.push(r.id.clone());
+                }
+            }
             if hard.is_empty() {
                 println!(
                     "{}",
