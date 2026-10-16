@@ -1,7 +1,7 @@
 //! Importer `claude-skills`: user skills (`~/.claude/skills/<name>/SKILL.md`) and slash
 //! commands (`~/.claude/commands/*.md`). Ported from `framework/importers/claude-skills.mjs`.
 
-use super::rules::{js_shown, js_slice, js_string, static_re, truthy};
+use super::rules::{js_shown, js_slice, js_string, scrub_text, static_re, truthy};
 use super::Importer;
 use crate::ctx::Ctx;
 use crate::yaml::parse_yaml;
@@ -48,6 +48,8 @@ impl Importer for ClaudeSkills {
             let raw = truthy(fm.get("description"))
                 .map(js_string)
                 .unwrap_or_default();
+            // Scrubbed before it is collapsed and cut (the reference does not scrub it).
+            let raw = scrub_text(ctx, &raw);
             let collapsed = raw.split_whitespace().collect::<Vec<_>>().join(" ");
             skills.push(json!({
                 "id": name,
@@ -73,7 +75,7 @@ impl Importer for ClaudeSkills {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::importers::rules::testing::home;
+    use crate::importers::rules::testing::{home, DROPPED};
     use serde_json::json;
 
     #[test]
@@ -83,10 +85,9 @@ mod tests {
             ".claude/skills/alpha/SKILL.md",
             "---\nname: alpha\ndescription: |\n  Does   many\n  things.\n---\n# Alpha\n",
         );
-        let long = format!("{} tail", "word ".repeat(60));
         h.write(
-            ".claude/skills/long/SKILL.md",
-            &format!("---\nname: long\ndescription: \"{long}\"\n---\nbody\n"),
+            ".claude/skills/pantry/SKILL.md",
+            "---\nname: pantry\ndescription: |\n  Sorts the   pantry list by aisle, merges duplicate items, and flags\n  anything past its best-before date.\tThen it prints a short summary\n  grouped by shelf so the weekly shop takes far less time than it used to,\n  even on busy evenings.\n---\nbody\n",
         );
         h.write(
             ".claude/skills/broken/SKILL.md",
@@ -101,20 +102,15 @@ mod tests {
         assert!(ClaudeSkills.detect(&ctx));
         let f = ClaudeSkills.run(&ctx, &json!({})).unwrap();
 
-        let expected_long: String = long
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ")
-            .chars()
-            .take(200)
-            .collect();
-        assert_eq!(expected_long.chars().count(), 200);
+        // whitespace collapsed, then a hard cut at 200 characters with no ellipsis
+        let pantry = "Sorts the pantry list by aisle, merges duplicate items, and flags anything past its best-before date. Then it prints a short summary grouped by shelf so the weekly shop takes far less time than it use";
+        assert_eq!(pantry.len(), 200);
         assert_eq!(
             f["tools"]["skills"],
             json!([
                 { "id": "alpha", "source": "~/.claude/skills/alpha/SKILL.md", "description": "Does many things." },
                 { "id": "broken", "source": "~/.claude/skills/broken/SKILL.md", "description": "" },
-                { "id": "long", "source": "~/.claude/skills/long/SKILL.md", "description": expected_long },
+                { "id": "pantry", "source": "~/.claude/skills/pantry/SKILL.md", "description": pantry },
                 { "id": "plain", "source": "~/.claude/skills/plain/SKILL.md", "description": "" }
             ])
         );
@@ -129,6 +125,43 @@ mod tests {
             f["_sources"],
             json!(["~/.claude/skills", "~/.claude/commands"])
         );
+    }
+
+    #[test]
+    fn skill_descriptions_are_cut_at_200_utf16_units() {
+        let h = home();
+        // 150 two-byte letters, a space, then 30 emoji of two UTF-16 units each
+        let text = format!("{} {} fin", "\u{e9}".repeat(150), "\u{1F642}".repeat(30));
+        h.write(
+            ".claude/skills/accents/SKILL.md",
+            &format!("---\ndescription: {text}\n---\n"),
+        );
+        let f = ClaudeSkills.run(&h.ctx(), &json!({})).unwrap();
+        // 150 + 1 + 24 * 2 = 199 units; the 25th emoji would split at unit 200, so it is dropped
+        let expected = format!("{} {}", "\u{e9}".repeat(150), "\u{1F642}".repeat(24));
+        assert_eq!(f["tools"]["skills"][0]["description"], json!(expected));
+    }
+
+    #[test]
+    fn skill_descriptions_are_scrubbed() {
+        let h = home();
+        h.write(
+            ".claude/skills/leaky/SKILL.md",
+            "---\ndescription: \"Posts with @TOKEN@ as the key\"\n---\n",
+        );
+        h.write(
+            ".claude/skills/paths/SKILL.md",
+            "---\ndescription: Reads @HOME@/notes/today.md   every morning\n---\n",
+        );
+        let ctx = h.ctx();
+        let f = ClaudeSkills.run(&ctx, &json!({})).unwrap();
+        assert_eq!(f["tools"]["skills"][0]["description"], json!("<redacted>"));
+        assert_eq!(
+            f["tools"]["skills"][1]["description"],
+            json!("Reads ~/notes/today.md every morning")
+        );
+        assert_eq!(ctx.warnings(), [DROPPED]);
+        assert!(!f.to_string().contains(&h.s()));
     }
 
     #[test]
