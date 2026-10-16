@@ -489,14 +489,27 @@ pub fn claude_settings_doc(desired: &Doc) -> Doc {
     Value::Object(out)
 }
 
+/// `source` the MCP importer gives a server defined under `projects` in `~/.claude.json`.
+const PROJECT_SOURCE: &str = "~/.claude.json#projects/";
+
+/// A server setup.yaml records as defined for one project, not for every session.
+pub(crate) fn mcp_project_scoped(server: &Doc) -> bool {
+    server
+        .get("source")
+        .and_then(|s| s.as_str())
+        .is_some_and(|s| s.starts_with(PROJECT_SOURCE))
+}
+
 /// Never rendered or installed: `enabled: false` servers, servers named in
-/// `tools.denied_mcp_servers`, and `name@source` ids. The MCP importer gives a second
+/// `tools.denied_mcp_servers`, project-scoped servers (rendering them as user-scope servers
+/// would widen them to every session), and `name@source` ids. The MCP importer gives a second
 /// definition of an existing name (a project-scoped or other-file duplicate) such an id, and
 /// rendering it under `name` would overwrite the user-scope server of that name. (The reference
-/// rendered them and let the last definition win.)
+/// rendered all of these but the disabled and denied ones, and let the last definition win.)
 pub(crate) fn mcp_excluded(server: &Doc, denied: &[Doc]) -> bool {
     server.get("enabled") == Some(&Value::Bool(false))
         || server.get("id").is_some_and(|id| denied.contains(id))
+        || mcp_project_scoped(server)
         || server
             .get("id")
             .and_then(|id| id.as_str())
@@ -1053,6 +1066,20 @@ pub(crate) mod tests {
             doc["mcpServers"]["notes"]["headers"]["Authorization"],
             json!("${AUTHORIZATION}")
         );
+    }
+
+    #[test]
+    fn apply_mcp_doc_skips_project_scoped_servers() {
+        let d = json!({
+            "meta": { "instance": "alex" },
+            "tools": { "mcp_servers": [
+                { "id": "notes", "source": "~/.claude.json", "transport": "http", "url": "https://mcp.example.com/notes" },
+                { "id": "proj", "source": "~/.claude.json#projects/~/work", "transport": "stdio", "command": "proj-server" }
+            ]}
+        });
+        let doc = mcp_servers_doc(&d);
+        let names: Vec<&String> = doc["mcpServers"].as_object().unwrap().keys().collect();
+        assert_eq!(names, ["notes"], "{doc}");
     }
 
     #[test]
