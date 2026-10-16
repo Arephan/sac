@@ -277,6 +277,12 @@ pub(crate) fn js_shown(ctx: &Ctx, rel: &str) -> String {
     ctx.tilde(&js_p(ctx, rel))
 }
 
+/// `Ctx::scrub` for one piece of free text: the home becomes `~`, and a secret-shaped value
+/// becomes `<redacted>` with a warning.
+pub(crate) fn scrub_text(ctx: &Ctx, s: &str) -> String {
+    js_string(&ctx.scrub(&Value::String(s.to_string())))
+}
+
 /// `Some(v)` only when `v` is present and truthy (JavaScript's `x || fallback` test).
 pub(crate) fn truthy(v: Option<&Doc>) -> Option<&Doc> {
     v.filter(|x| is_truthy(Some(x)))
@@ -372,11 +378,15 @@ pub(crate) mod testing {
             self.root.to_string_lossy().to_string()
         }
         /// Write `text` to `rel` (relative to the home), creating parent directories.
-        /// Every `@HOME@` in `text` becomes the home path.
+        /// Every `@HOME@` in `text` becomes the home path and every `@TOKEN@` a token-shaped
+        /// string (see `token`).
         pub fn write(&self, rel: &str, text: &str) {
             let p = self.root.join(rel);
             std::fs::create_dir_all(p.parent().expect("parent")).expect("mkdir");
-            std::fs::write(p, text.replace("@HOME@", &self.s())).expect("write");
+            let text = text
+                .replace("@HOME@", &self.s())
+                .replace("@TOKEN@", &token());
+            std::fs::write(p, text).expect("write");
         }
         /// Create an empty directory `rel` under the home.
         pub fn mkdir(&self, rel: &str) {
@@ -390,6 +400,15 @@ pub(crate) mod testing {
             self.ctx_with(json!({}))
         }
     }
+
+    /// A chat-token-shaped string, assembled at run time so no secret-shaped literal sits in
+    /// the source tree.
+    pub fn token() -> String {
+        format!("xoxb-{}-{}", "1234567890", "abcdefghij")
+    }
+
+    /// The warning `Ctx::scrub` records for each token it drops.
+    pub const DROPPED: &str = "dropped a secret-looking value (slack-token)";
 
     /// The keys of an object in document order (`==` on documents ignores key order).
     pub fn keys(v: &crate::Doc) -> Vec<&str> {
@@ -407,7 +426,7 @@ mod tests {
     #[test]
     fn classify_scope_picks_the_scope_with_most_keyword_hits() {
         assert_eq!(
-            classify_scope("Never spend money on a purchase", None),
+            classify_scope("Compare the price before any purchase", None),
             "money"
         );
         assert_eq!(classify_scope("nothing to see here", None), "global");
@@ -436,7 +455,7 @@ mod tests {
 
     #[test]
     fn severity_is_hard_only_for_the_uppercase_word() {
-        assert_eq!(severity_of("MONEY HARD RULE"), "hard");
+        assert_eq!(severity_of("GARDEN HARD RULE"), "hard");
         assert_eq!(severity_of("(HARD)"), "hard");
         assert_eq!(severity_of("HARD"), "hard");
         assert_eq!(severity_of("hard rule"), "standing");
@@ -449,14 +468,14 @@ mod tests {
     #[test]
     fn first_date_finds_the_first_dated_text() {
         assert_eq!(
-            first_date(&["no date", "since 2026-09-02, then 2026-10-01"]),
-            Some("2026-09-02".to_string())
+            first_date(&["no date", "since 2031-05-06, then 2031-06-07"]),
+            Some("2031-05-06".to_string())
         );
         assert_eq!(
-            first_date(&["(2025-01-31)", "2026-01-01"]),
-            Some("2025-01-31".to_string())
+            first_date(&["(2030-01-31)", "2031-01-01"]),
+            Some("2030-01-31".to_string())
         );
-        assert_eq!(first_date(&["x2026-01-01", "2026-10-15T08:00"]), None);
+        assert_eq!(first_date(&["x2031-01-01", "2031-02-03T08:00"]), None);
         assert_eq!(first_date(&["1999-01-01", ""]), None);
         assert_eq!(first_date(&[]), None);
     }

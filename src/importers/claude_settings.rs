@@ -49,7 +49,8 @@ fn hook_list(ctx: &Ctx, settings: &Doc) -> Vec<Doc> {
     for (event, groups) in entries(settings.get("hooks")) {
         for group in arr(Some(groups)) {
             let matcher = truthy(group.get("matcher"));
-            for hook in arr(group.get("hooks")) {
+            // A null hook is skipped (the reference crashes on it).
+            for hook in arr(group.get("hooks")).iter().filter(|h| !h.is_null()) {
                 let raw = present(hook.get("command"))
                     .or_else(|| present(hook.get("url")))
                     .or_else(|| present(hook.get("type")));
@@ -130,22 +131,20 @@ impl Importer for ClaudeSettings {
         if let Some(mode) = truthy(perms.get("defaultMode")) {
             permissions.insert("default_mode".into(), mode.clone());
         }
-        let allow: Vec<Doc> = uniq(&[perms.get("allow"), local_perms.get("allow")])
-            .iter()
-            .map(|x| ctx.scrub(x))
-            .collect();
-        permissions.insert("allow".into(), Value::Array(allow));
-        permissions.insert(
-            "deny".into(),
-            Value::Array(uniq(&[perms.get("deny"), local_perms.get("deny")])),
-        );
-        permissions.insert(
-            "ask".into(),
-            Value::Array(uniq(&[perms.get("ask"), local_perms.get("ask")])),
-        );
+        // All three lists are scrubbed. The reference scrubs only `allow`; scrubbing `deny`
+        // and `ask` too keeps home paths and secret-shaped values out of the manifest.
+        for key in ["allow", "deny", "ask"] {
+            let list: Vec<Doc> = uniq(&[perms.get(key), local_perms.get(key)])
+                .iter()
+                .map(|x| ctx.scrub(x))
+                .collect();
+            permissions.insert(key.into(), Value::Array(list));
+        }
 
+        // A null entry is skipped (the reference crashes on it).
         let denied: Vec<Doc> = arr(s.get("deniedMcpServers"))
             .iter()
+            .filter(|d| !d.is_null())
             .map(|d| {
                 truthy(d.get("serverName"))
                     .or_else(|| truthy(d.get("serverUrl")))
@@ -170,13 +169,13 @@ impl Importer for ClaudeSettings {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::importers::rules::testing::{home, keys};
+    use crate::importers::rules::testing::{home, keys, DROPPED};
     use serde_json::json;
 
     const SETTINGS: &str = r#"{
       "model": "opus",
       "effortLevel": "high",
-      "env": { "EXAMPLE_API_KEY": "@SECRET@", "DEBUG_LEVEL": "1" },
+      "env": { "EXAMPLE_API_KEY": "@TOKEN@", "DEBUG_LEVEL": "1" },
       "permissions": {
         "allow": ["Bash(ls)", "Read(@HOME@/notes/*)"],
         "deny": ["mcp__work__*"],
@@ -194,17 +193,10 @@ mod tests {
       "extraKnownMarketplaces": { "example-market": { "source": { "source": "github", "repo": "example/market" } } }
     }"#;
 
-    fn secret() -> String {
-        format!("xoxb-{}-{}", "1234567890", "abcdefghij")
-    }
-
     #[test]
     fn settings_keep_env_names_only_and_list_hooks_plugins_and_denied_servers() {
         let h = home();
-        h.write(
-            ".claude/settings.json",
-            &SETTINGS.replace("@SECRET@", &secret()),
-        );
+        h.write(".claude/settings.json", SETTINGS);
         h.write(
             ".claude/settings.local.json",
             r#"{ "permissions": { "allow": ["Bash(ls)", "WebFetch(domain:example.com)"], "deny": ["Bash(rm:*)"] } }"#,
@@ -280,6 +272,84 @@ mod tests {
         let text = f.to_string();
         assert!(!text.contains("xoxb"), "an env value leaked: {text}");
         assert!(!text.contains(&h.s()), "a home path leaked: {text}");
+    }
+
+    #[test]
+    fn settings_scrub_permission_lists_and_hook_commands() {
+        let h = home();
+        h.write(
+            ".claude/settings.json",
+            r#"{
+              "permissions": {
+                "allow": ["Read(@HOME@/notes/*)", "Bash(curl -H @TOKEN@)"],
+                "deny": ["Read(@HOME@/private/**)", "Bash(echo @TOKEN@)"],
+                "ask": ["Edit(@HOME@/notes/todo.md)", "WebFetch(@TOKEN@)"]
+              },
+              "hooks": {
+                "Stop": [{ "hooks": [
+                  { "type": "command", "command": "@HOME@/bin/notify --key @TOKEN@" },
+                  { "type": "command", "command": "@HOME@/bin/done.sh" }
+                ] }]
+              }
+            }"#,
+        );
+        let ctx = h.ctx();
+        let f = ClaudeSettings.run(&ctx, &json!({})).unwrap();
+        assert_eq!(
+            f["tools"]["permissions"],
+            json!({
+                "allow": ["Read(~/notes/*)", "<redacted>"],
+                "deny": ["Read(~/private/**)", "<redacted>"],
+                "ask": ["Edit(~/notes/todo.md)", "<redacted>"]
+            })
+        );
+        assert_eq!(
+            f["tools"]["hooks"],
+            json!([
+                { "id": "stop-any-redacted", "event": "Stop", "matcher": "*", "command": "<redacted>" },
+                { "id": "stop-any-done-sh", "event": "Stop", "matcher": "*", "command": "~/bin/done.sh" }
+            ])
+        );
+        // one warning per dropped value: the hook command, then allow, deny and ask
+        assert_eq!(ctx.warnings(), [DROPPED; 4]);
+        let text = f.to_string();
+        assert!(!text.contains("xoxb"), "a token leaked: {text}");
+        assert!(!text.contains(&h.s()), "a home path leaked: {text}");
+    }
+
+    #[test]
+    fn settings_skip_null_entries_and_keep_plain_string_denied_servers() {
+        let h = home();
+        h.write(
+            ".claude/settings.json",
+            r#"{
+              "deniedMcpServers": [
+                null, "plain-server", { "serverName": "work" }, { "serverUrl": "https://mcp.example.com/x" }, 7
+              ],
+              "hooks": {
+                "PreToolUse": [
+                  null,
+                  { "matcher": "Bash", "hooks": [null, { "type": "command", "command": "guard" }, "loose"] }
+                ]
+              }
+            }"#,
+        );
+        let ctx = h.ctx();
+        let f = ClaudeSettings.run(&ctx, &json!({})).unwrap();
+        assert_eq!(
+            f["tools"]["denied_mcp_servers"],
+            json!(["plain-server", "work", "https://mcp.example.com/x", "7"])
+        );
+        // null groups and null hooks are skipped; a non-null entry that is not an object
+        // still becomes a hook with command `undefined`, as in the reference
+        assert_eq!(
+            f["tools"]["hooks"],
+            json!([
+                { "id": "pretooluse-bash-guard", "event": "PreToolUse", "matcher": "Bash", "command": "guard" },
+                { "id": "pretooluse-bash-undefined", "event": "PreToolUse", "matcher": "Bash", "command": "undefined" }
+            ])
+        );
+        assert!(ctx.warnings().is_empty());
     }
 
     #[test]

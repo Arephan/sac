@@ -2,7 +2,9 @@
 //! a rule; each `@path` import line becomes a source (the imported file is not read).
 //! Ported from `framework/importers/claude-instructions.mjs`.
 
-use super::rules::{classify_scope, first_date, js_shown, js_slice, severity_of, static_re};
+use super::rules::{
+    classify_scope, first_date, js_shown, js_slice, scrub_text, severity_of, static_re,
+};
 use super::Importer;
 use crate::ctx::Ctx;
 use crate::util::{one_line, slug};
@@ -16,12 +18,15 @@ const MAIN: &str = "~/.claude/CLAUDE.md";
 
 /// One rule per `## ` section of `text`: id from the heading's title (the part before a
 /// spaced dash or an opening parenthesis), severity and status from markers in the heading,
-/// reason from a quote or parenthesis in the heading, statement from the body.
+/// reason from a quote or parenthesis in the heading, statement from the body. `scrub` cleans
+/// the reason and statement text before they are cut to length (the importer passes
+/// `Ctx::scrub`, so home paths become `~` and secret-shaped text is dropped).
 pub fn parse_instruction_sections(
     text: &str,
     source: &str,
     scope_keywords: Option<&Doc>,
     fallback_date: Option<&str>,
+    scrub: &dyn Fn(&str) -> String,
 ) -> Vec<Doc> {
     let mut rules = Vec::new();
     for part in static_re!(r"(?m)^## ").split(text).skip(1) {
@@ -47,8 +52,8 @@ pub fn parse_instruction_sections(
             "scope": classify_scope(&scope_text, scope_keywords),
             "severity": severity_of(heading),
             "date": first_date(&[heading, body]).or_else(|| fallback_date.map(str::to_string)),
-            "reason": one_line(&reason, 200),
-            "statement": one_line(&statement, 400),
+            "reason": one_line(&scrub(&reason), 200),
+            "statement": one_line(&scrub(&statement), 400),
             "source": source,
             "status": if heading.contains("SUPERSEDED") { "superseded" } else { "active" },
         }));
@@ -90,6 +95,7 @@ impl Importer for ClaudeInstructions {
             MAIN,
             opts.get("scope_keywords"),
             ctx.mtime_date(MAIN).as_deref(),
+            &|s: &str| scrub_text(ctx, s),
         );
         Ok(json!({
             "instructions": { "sources": sources, "rules": rules },
@@ -101,24 +107,24 @@ impl Importer for ClaudeInstructions {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::importers::rules::testing::{home, keys};
+    use crate::importers::rules::testing::{home, keys, DROPPED};
     use serde_json::json;
 
-    const CLAUDE_MD: &str = "@RTK.md
+    const CLAUDE_MD: &str = "@NOTES.md
 @skills/x/SKILL.md
 @~/shared/RULES.md
 
 Intro text that is not a rule.
 
-## MONEY — HARD RULE (owner 2026-08-29: \"never spend\")
-- No money leaves any account.
-- Research   prices only.
+## BIKES — HARD RULE (crew 2031-04-05: \"lock every bike\")
+- Chain each bike to the rack.
+- Test   the brakes weekly.
 
-## Old browser rule (SUPERSEDED by the new one)
-Use the old browser.
+## Old pump rule (SUPERSEDED by the new one)
+Use the old floor pump.
 
-## Style
-Keep replies short.
+## Formatting
+Use metric units.
 ### Sub heading stays in the body
 ";
 
@@ -135,7 +141,7 @@ Keep replies short.
             f["instructions"]["sources"],
             json!([
                 { "id": "global-claude-md", "path": "~/.claude/CLAUDE.md", "kind": "global" },
-                { "id": "import-rtk-md", "path": "~/.claude/RTK.md", "kind": "import" },
+                { "id": "import-notes-md", "path": "~/.claude/NOTES.md", "kind": "import" },
                 { "id": "import-skills-x-skill-md", "path": "~/.claude/skills/x/SKILL.md", "kind": "import" },
                 { "id": "import-shared-rules-md", "path": "~/shared/RULES.md", "kind": "import" }
             ])
@@ -145,31 +151,31 @@ Keep replies short.
         assert_eq!(
             rules[0],
             json!({
-                "id": "md-money",
-                "scope": "money",
+                "id": "md-bikes",
+                "scope": "code",
                 "severity": "hard",
-                "date": "2026-08-29",
-                "reason": "never spend",
-                "statement": "No money leaves any account. Research prices only.",
+                "date": "2031-04-05",
+                "reason": "lock every bike",
+                "statement": "Chain each bike to the rack. Test the brakes weekly.",
                 "source": "~/.claude/CLAUDE.md",
                 "status": "active"
             })
         );
-        assert_eq!(rules[1]["id"], json!("md-old-browser-rule"));
+        assert_eq!(rules[1]["id"], json!("md-old-pump-rule"));
         assert_eq!(rules[1]["status"], json!("superseded"));
         assert_eq!(rules[1]["severity"], json!("standing"));
         assert_eq!(rules[1]["reason"], json!("SUPERSEDED by the new one"));
-        assert_eq!(rules[1]["scope"], json!("browser"));
+        assert_eq!(rules[1]["scope"], json!("global"));
         assert_eq!(rules[1]["date"], json!(mtime));
         assert_eq!(
             rules[2],
             json!({
-                "id": "md-style",
+                "id": "md-formatting",
                 "scope": "global",
                 "severity": "standing",
                 "date": mtime,
-                "reason": "Style",
-                "statement": "Keep replies short. ### Sub heading stays in the body",
+                "reason": "Formatting",
+                "statement": "Use metric units. ### Sub heading stays in the body",
                 "source": "~/.claude/CLAUDE.md",
                 "status": "active"
             })
@@ -220,10 +226,11 @@ Keep replies short.
     #[test]
     fn section_titles_reasons_and_dates_follow_the_heading_rules() {
         let rules = parse_instruction_sections(
-            "## (only parens)\nx\n## Hyphen - split - title (with (nested) parens)\nbody\n## Empty () reason\n## Curly “quoted” – en dash\nsee 2026-13-45\n",
+            "## (only parens)\nx\n## Hyphen - split - title (with (nested) parens)\nbody\n## Empty () reason\n## Curly “quoted” – en dash\nsee 2031-13-45\n",
             "~/CLAUDE.md",
             None,
             None,
+            &|s: &str| s.to_string(),
         );
         let ids: Vec<&str> = rules.iter().map(|r| r["id"].as_str().unwrap()).collect();
         assert_eq!(ids, ["md-item", "md-hyphen", "md-empty", "md-curly-quoted"]);
@@ -232,9 +239,33 @@ Keep replies short.
         assert_eq!(rules[2]["reason"], json!("Empty"));
         assert_eq!(rules[3]["reason"], json!("quoted"));
         // the date pattern does not validate month or day, as in the reference
-        assert_eq!(rules[3]["date"], json!("2026-13-45"));
+        assert_eq!(rules[3]["date"], json!("2031-13-45"));
         assert_eq!(rules[0]["date"], json!(null));
         assert_eq!(rules[2]["statement"], json!(""));
+    }
+
+    #[test]
+    fn section_reasons_and_statements_are_scrubbed() {
+        let h = home();
+        h.write(
+            ".claude/CLAUDE.md",
+            "## Drafts (kept in @HOME@/drafts)\nSave drafts under @HOME@/drafts/new before sharing.\n\n## Keys\nThe service key is @TOKEN@ for now.\n",
+        );
+        let ctx = h.ctx();
+        let f = ClaudeInstructions.run(&ctx, &json!({})).unwrap();
+        let rules = &f["instructions"]["rules"];
+        assert_eq!(rules[0]["id"], json!("md-drafts"));
+        assert_eq!(rules[0]["reason"], json!("kept in ~/drafts"));
+        assert_eq!(
+            rules[0]["statement"],
+            json!("Save drafts under ~/drafts/new before sharing.")
+        );
+        assert_eq!(rules[1]["reason"], json!("Keys"));
+        assert_eq!(rules[1]["statement"], json!("<redacted>"));
+        assert_eq!(ctx.warnings(), [DROPPED]);
+        let text = f.to_string();
+        assert!(!text.contains("xoxb"), "a token leaked: {text}");
+        assert!(!text.contains(&h.s()), "a home path leaked: {text}");
     }
 
     #[test]

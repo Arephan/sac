@@ -10,8 +10,8 @@
 //! hardcoded. Ported from `framework/importers/claude-memory.mjs`.
 
 use super::rules::{
-    classify_scope, first_date, js_order, js_p, js_shown, js_slice, js_string, severity_of,
-    static_re, truthy,
+    classify_scope, first_date, js_order, js_p, js_shown, js_slice, js_string, scrub_text,
+    severity_of, static_re, truthy,
 };
 use super::Importer;
 use crate::ctx::Ctx;
@@ -149,6 +149,13 @@ impl Importer for ClaudeMemory {
                     let why = static_re!(r"(?i)\*\*Why:?\*\*:?\s*([^\n]+)")
                         .captures(&body)
                         .map(|c| c[1].to_string());
+                    // Text is scrubbed before it is cut; the description is scrubbed once even
+                    // when it is also the reason.
+                    let statement = scrub_text(ctx, &desc);
+                    let reason = match &why {
+                        Some(w) => scrub_text(ctx, w),
+                        None => statement.clone(),
+                    };
                     let superseded = desc.to_ascii_uppercase().contains("SUPERSEDED");
                     let scope_text = format!("{desc} {}", id.replace(['_', '-'], " "));
                     rules.push(json!({
@@ -156,8 +163,8 @@ impl Importer for ClaudeMemory {
                         "scope": classify_scope(&scope_text, scope_keywords),
                         "severity": severity_of(&desc),
                         "date": date,
-                        "reason": one_line(why.as_deref().unwrap_or(&desc), 240),
-                        "statement": one_line(&desc, 280),
+                        "reason": one_line(&reason, 240),
+                        "statement": one_line(&statement, 280),
                         "source": src,
                         "status": if superseded { "superseded" } else { "active" },
                     }));
@@ -165,7 +172,8 @@ impl Importer for ClaudeMemory {
                 Some("project") => {
                     let mut p = Map::new();
                     p.insert("id".into(), json!(id));
-                    p.insert("description".into(), json!(one_line(&desc, 240)));
+                    let shown_desc = scrub_text(ctx, &desc);
+                    p.insert("description".into(), json!(one_line(&shown_desc, 240)));
                     p.insert("status".into(), json!(status_of(&desc)));
                     if let Some(m) =
                         static_re!(r"~/[A-Za-z0-9_.@-]+(?:/[A-Za-z0-9_.@-]+)*").find(&desc)
@@ -177,7 +185,7 @@ impl Importer for ClaudeMemory {
                 }
                 Some("reference") => references.push(json!({
                     "id": id,
-                    "description": one_line(&desc, 200),
+                    "description": one_line(&scrub_text(ctx, &desc), 200),
                     "source": src,
                 })),
                 Some("user") => profile.push(src),
@@ -215,7 +223,7 @@ impl Importer for ClaudeMemory {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::importers::rules::testing::{home, keys, Home};
+    use crate::importers::rules::testing::{home, keys, Home, DROPPED};
     use crate::util::claude_project_slug;
     use serde_json::json;
 
@@ -230,14 +238,14 @@ mod tests {
     fn memory_files_become_rules_projects_references_and_profile_refs() {
         let h = home();
         let (rel, shown) = memory_dir(&h);
-        h.write(&format!("{rel}/MEMORY.md"), "# Memory Index\n- [x](x.md)\n");
+        h.write(&format!("{rel}/MEMORY.md"), "# Index\n");
         h.write(
-            &format!("{rel}/feedback_money.md"),
-            "---\nname: no-spend\ndescription: HARD never spend money (2026-08-29)\nmetadata:\n  type: feedback\n---\nNever buy anything.\n\n**Why:** the owner said so.\n**How to apply:** stop at checkout.\n",
+            &format!("{rel}/feedback_garden.md"),
+            "---\nname: water-tomatoes\ndescription: HARD water the tomatoes before noon (2031-02-03)\nmetadata:\n  type: feedback\n---\nWater early.\n\n**Why:** leaves scorch in the afternoon sun.\n**How to apply:** set a morning reminder.\n",
         );
         h.write(
-            &format!("{rel}/project_app.md"),
-            "---\ndescription: Example app at ~/code/example-app, SHIPPED to the store\ntype: project\n---\nNotes.\n",
+            &format!("{rel}/project_planner.md"),
+            "---\ndescription: Garden planner at ~/code/garden-planner, SHIPPED last spring\ntype: project\n---\nNotes.\n",
         );
         h.write(
             &format!("{rel}/reference_docs.md"),
@@ -263,24 +271,24 @@ mod tests {
         assert_eq!(
             f["instructions"]["rules"],
             json!([{
-                "id": "mem-no-spend",
-                "scope": "money",
+                "id": "mem-water-tomatoes",
+                "scope": "global",
                 "severity": "hard",
-                "date": "2026-08-29",
-                "reason": "the owner said so.",
-                "statement": "HARD never spend money (2026-08-29)",
-                "source": format!("{shown}/feedback_money.md"),
+                "date": "2031-02-03",
+                "reason": "leaves scorch in the afternoon sun.",
+                "statement": "HARD water the tomatoes before noon (2031-02-03)",
+                "source": format!("{shown}/feedback_garden.md"),
                 "status": "active"
             }])
         );
         assert_eq!(
             f["projects"],
             json!([{
-                "id": "project_app",
-                "description": "Example app at ~/code/example-app, SHIPPED to the store",
+                "id": "project_planner",
+                "description": "Garden planner at ~/code/garden-planner, SHIPPED last spring",
                 "status": "live",
-                "path": "~/code/example-app",
-                "source": format!("{shown}/project_app.md")
+                "path": "~/code/garden-planner",
+                "source": format!("{shown}/project_planner.md")
             }])
         );
         assert_eq!(
@@ -337,11 +345,11 @@ mod tests {
         let (rel, _) = memory_dir(&h);
         h.write(
             &format!("{rel}/a_old.md"),
-            "---\nname: old-way\ndescription: use the old way, superseded later\nmetadata:\n  type: feedback\n  modified: 2025-03-04T10:00:00Z\n---\nbody\n",
+            "---\nname: old-way\ndescription: use the old way, superseded later\nmetadata:\n  type: feedback\n  modified: 2031-03-04T10:00:00Z\n---\nbody\n",
         );
         h.write(
             &format!("{rel}/b_plain.md"),
-            "---\nname: plain\ndescription: keep it short\nmetadata:\n  type: feedback\n---\n",
+            "---\nname: plain\ndescription: prune the roses in spring\nmetadata:\n  type: feedback\n---\n",
         );
         let ctx = h.ctx();
         let mtime = ctx.mtime_date(&format!("~/{rel}/b_plain.md")).unwrap();
@@ -354,7 +362,7 @@ mod tests {
         );
         assert_eq!(rules[0]["status"], json!("superseded"));
         assert_eq!(rules[0]["severity"], json!("standing"));
-        assert_eq!(rules[0]["date"], json!("2025-03-04"));
+        assert_eq!(rules[0]["date"], json!("2031-03-04"));
         assert_eq!(rules[1]["date"], json!(mtime));
         assert_eq!(f["identity"], json!({}));
         assert_eq!(f["projects"], json!([]));
@@ -365,8 +373,8 @@ mod tests {
         let h = home();
         let (rel, _) = memory_dir(&h);
         h.write(
-            &format!("{rel}/project_token_audit.md"),
-            "---\nname: audit\nmetadata:\n  type: project\n---\n",
+            &format!("{rel}/notes_secret_recipes.md"),
+            "---\nname: recipes\nmetadata:\n  type: project\n---\n",
         );
         let ctx = h.ctx();
         let f = ClaudeMemory.run(&ctx, &json!({})).unwrap();
@@ -379,6 +387,43 @@ mod tests {
             w[0].starts_with("refused to read secret-looking file"),
             "{w:?}"
         );
+    }
+
+    #[test]
+    fn memory_text_fields_are_scrubbed() {
+        let h = home();
+        let (rel, _) = memory_dir(&h);
+        h.write(
+            &format!("{rel}/feedback_drafts.md"),
+            "---\nname: drafts-folder\ndescription: keep drafts in @HOME@/drafts\nmetadata:\n  type: feedback\n---\n**Why:** the sync tool reads @TOKEN@\n",
+        );
+        h.write(
+            &format!("{rel}/project_site.md"),
+            "---\nname: site\ndescription: static site built from @HOME@/code/site\nmetadata:\n  type: project\n---\n",
+        );
+        h.write(
+            &format!("{rel}/reference_vault.md"),
+            "---\nname: vault\ndescription: \"service login @TOKEN@\"\nmetadata:\n  type: reference\n---\n",
+        );
+        let ctx = h.ctx();
+        let f = ClaudeMemory.run(&ctx, &json!({})).unwrap();
+        let rule = &f["instructions"]["rules"][0];
+        assert_eq!(rule["statement"], json!("keep drafts in ~/drafts"));
+        assert_eq!(rule["reason"], json!("<redacted>"));
+        assert_eq!(
+            f["projects"][0]["description"],
+            json!("static site built from ~/code/site")
+        );
+        // the path is still read from the description as written, as in the reference
+        assert!(f["projects"][0].get("path").is_none());
+        assert_eq!(
+            f["data"]["references"][0]["description"],
+            json!("<redacted>")
+        );
+        assert_eq!(ctx.warnings(), [DROPPED, DROPPED]);
+        let text = f.to_string();
+        assert!(!text.contains("xoxb"), "a token leaked: {text}");
+        assert!(!text.contains(&h.s()), "a home path leaked: {text}");
     }
 
     #[test]
