@@ -19,7 +19,7 @@ Status: 1.0.0-dev. macOS is what I use every day; Linux runs in CI but I haven't
 Needs Node 22+.
 
 ```
-npx github:Arephan/setup-as-code save --dry-run
+npx github:Arephan/sac save --dry-run
 ```
 
 Or clone, `npm install && npm run build`, and use `node dist/bin.js`.
