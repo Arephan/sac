@@ -64,14 +64,19 @@ you pass `--allow-missing`.
 
 ## Restore details
 
-Arguments are folders or git URLs. Overwritten files are copied to `~/.sac/backups/<time>/` first.
+Arguments are folders or git URLs. Overwritten files (and the old config of any MCP server it
+replaces) are copied to `~/.sac/backups/<time>/` first.
 Your existing `settings.json` is merged rather than replaced (lists combine, keys you have that the
 repo doesn't are kept). Plugins and MCP servers go through `claude plugin` and `claude mcp`; `sac`
 doesn't write `~/.claude.json` itself. It also never deletes anything. Run it twice and the
 second run says everything already matches.
 
-Jobs get written but stay unloaded unless you add `--load-jobs`. With `--config-dir` they go to
-`<dir>/sac-jobs/` and can't be loaded at all.
+Jobs are parked in `~/.sac/jobs/` and the plan prints the commands to load them. They don't go
+into `~/Library/LaunchAgents` on their own, because launchd would start them at the next login.
+`--load-jobs` puts them there and loads them (or adds the crontab line). With `--config-dir` they
+go to `<dir>/sac-jobs/` and can't be loaded at all.
+
+A repo pulled from a git URL can't bring symlinks or its own `.env` along; both are ignored.
 
 ## Layering, for teams
 
@@ -94,7 +99,7 @@ settings people must not override, use Claude Code's managed settings.
 ## doctor
 
 Lists what's missing or different: files, plugins in the wrong state, MCP servers that are gone or
-failing in `claude mcp list`, secrets it can't find, unloaded jobs, missing dependencies, and a
+failing in `claude mcp list`, secrets it can't find, jobs that aren't loaded, files a job needs that are gone, and a
 Claude Code older than the one the setup came from. Things you have that no layer has are shown
 too, but they don't fail the check.
 

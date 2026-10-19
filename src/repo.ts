@@ -1,5 +1,5 @@
-import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, rmdirSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { basename, dirname, join, sep } from "node:path";
+import { chmodSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { basename, dirname, join, relative, sep } from "node:path";
 import { createTwoFilesPatch } from "diff";
 import { execa } from "execa";
 import fg from "fast-glob";
@@ -50,13 +50,35 @@ export function setupToRepo(setup: Setup, secrets: SecretRef[]): RepoFiles {
 export function readMeta(dir: string): RepoMeta {
   const path = join(dir, "sac.yaml");
   if (!existsSync(path)) throw new Error(`${dir} is not a setup repo (no sac.yaml)`);
+  if (!isPlain(path)) throw new Error(`${path} is not a regular file`);
   const meta = YAML.parse(readFileSync(path, "utf8")) ?? {};
   if (meta.version !== 1) throw new Error(`${path}: unsupported version ${JSON.stringify(meta.version)}`);
   return { version: 1, name: typeof meta.name === "string" && meta.name ? meta.name : basename(dir), captured: meta.captured, extends: Array.isArray(meta.extends) ? meta.extends.map(String) : [] };
 }
 
+/**
+ * Regular files under `root` matching `pattern`, never through a symlink: a repo cloned from a
+ * git URL could otherwise point a setup file at anything the user can read.
+ */
+function plainFiles(root: string, pattern: string): string[] {
+  if (!existsSync(root) || lstatSync(root).isSymbolicLink()) return [];
+  const real = realpathSync(root);
+  return fg
+    .sync(pattern, { cwd: root, dot: true, onlyFiles: true, followSymbolicLinks: false })
+    .filter((p) => {
+      const abs = join(root, p);
+      if (lstatSync(abs).isSymbolicLink() || !lstatSync(abs).isFile()) return false;
+      const r = relative(real, realpathSync(abs));
+      return !r.startsWith("..") && !r.startsWith(sep);
+    })
+    .sort();
+}
+
+const isPlain = (path: string) => existsSync(path) && !lstatSync(path).isSymbolicLink() && lstatSync(path).isFile();
+
 const readJson = (path: string): any => {
   if (!existsSync(path)) return {};
+  if (!isPlain(path)) throw new Error(`${path} is not a regular file`);
   try {
     return JSON.parse(readFileSync(path, "utf8")) ?? {};
   } catch (e) {
@@ -66,19 +88,15 @@ const readJson = (path: string): any => {
 
 export function readRepo(dir: string): Setup {
   const meta = readMeta(dir);
-  const files: SavedFile[] = existsSync(join(dir, "claude"))
-    ? fg.sync("**/*", { cwd: join(dir, "claude"), dot: true, onlyFiles: true }).sort().map((p) => {
+  const files: SavedFile[] = plainFiles(join(dir, "claude"), "**/*").map((p) => {
         const abs = join(dir, "claude", p);
         return { path: p.split(sep).join("/"), data: readFileSync(abs), mode: statSync(abs).mode & 0o777 };
-      })
-    : [];
+      });
   const plugins = readJson(join(dir, "plugins.json"));
-  const jobs: JobDef[] = existsSync(join(dir, "jobs"))
-    ? fg.sync("*.yaml", { cwd: join(dir, "jobs") }).sort().map((p) => {
+  const jobs: JobDef[] = plainFiles(join(dir, "jobs"), "*.yaml").map((p) => {
         const j = YAML.parse(readFileSync(join(dir, "jobs", p), "utf8")) ?? {};
         return { ...j, label: String(j.label ?? p.replace(/\.yaml$/, "")), kind: j.kind === "cron" ? "cron" : "launchd", program: (j.program ?? []).map(String), schedule: j.schedule ?? {}, env: j.env ?? {}, dependencies: j.dependencies ?? [] };
-      })
-    : [];
+      });
   return {
     name: meta.name,
     captured: meta.captured,

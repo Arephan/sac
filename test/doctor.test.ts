@@ -46,7 +46,7 @@ beforeEach(async () => {
   writeFileSync(join(b.home, "my-plugins/.claude-plugin/marketplace.json"), JSON.stringify({ name: "local", plugins: [] }));
   mkdirSync(join(b.home, "bin"), { recursive: true });
   writeFileSync(join(b.home, "bin/nightly.sh"), "#!/bin/sh\nclaude -p 'nightly sweep'\n", { mode: 0o755 });
-  expect(await restore({ sources: [repo], target: darwin(b), yes: true, io, interactive: false, envFile })).toBe(0);
+  expect(await restore({ sources: [repo], target: darwin(b), yes: true, io, interactive: false, envFile, loadJobs: true })).toBe(0);
   out = "";
 });
 
@@ -58,12 +58,17 @@ afterEach(() => {
 });
 
 describe("sac doctor", () => {
-  it("passes right after a restore, warning only that jobs are not loaded", async () => {
+  it("passes right after a restore", async () => {
     const r = await check();
+    expect(r.findings).toEqual([]);
     expect(r.ok).toBe(true);
-    expect(messages(r, "missing")).toEqual([]);
-    expect(messages(r, "differs")).toEqual([]);
-    expect(messages(r, "warn")).toEqual(["job com.example.claude-digest is written but not loaded", "job com.example.script-job is written but not loaded"]);
+  });
+
+  it("fails when a job is not loaded", async () => {
+    writeFileSync(join(b.home, ".sac-test-loaded"), "com.example.script-job\n");
+    const r = await check();
+    expect(r.ok).toBe(false);
+    expect(messages(r, "missing")).toEqual(["job com.example.claude-digest is not loaded"]);
   });
 
   it("reports a removed skill, a disabled plugin, a failing server and an unknown secret", async () => {

@@ -1,5 +1,6 @@
 import { existsSync, mkdirSync, realpathSync, rmSync } from "node:fs";
 import { homedir } from "node:os";
+import { createHash } from "node:crypto";
 import { join, posix, resolve } from "node:path";
 import deepmerge from "deepmerge";
 import { execa } from "execa";
@@ -24,14 +25,17 @@ export function isGitUrl(s: string): boolean {
 const firstLine = (s: unknown) => String(s ?? "").trim().split("\n")[0];
 
 async function fetchGit(url: string, cacheDir: string): Promise<string> {
-  const dir = join(cacheDir, url.replace(/^[a-z]+:\/\//, "").replace(/[^A-Za-z0-9._-]+/g, "_").slice(-120));
+  if (url.startsWith("-")) throw new Error(`not a git URL: ${url}`);
+  const readable = url.replace(/^[a-z]+:\/\//, "").replace(/[^A-Za-z0-9._-]+/g, "_").slice(-60);
+  const dir = join(cacheDir, `${readable}-${createHash("sha256").update(url).digest("hex").slice(0, 12)}`);
   if (existsSync(join(dir, ".git"))) {
-    const pull = await execa("git", ["-C", dir, "pull", "-q", "--ff-only"], { reject: false });
-    if (pull.exitCode === 0) return dir;
+    const origin = await execa("git", ["-C", dir, "remote", "get-url", "origin"], { reject: false });
+    const pull = String(origin.stdout).trim() !== url ? null : await execa("git", ["-C", dir, "pull", "-q", "--ff-only"], { reject: false });
+    if (pull?.exitCode === 0) return dir;
     rmSync(dir, { recursive: true, force: true });
   }
   mkdirSync(cacheDir, { recursive: true });
-  const clone = await execa("git", ["clone", "-q", "--depth", "1", url, dir], { reject: false });
+  const clone = await execa("git", ["clone", "-q", "--depth", "1", "--", url, dir], { reject: false });
   if (clone.exitCode !== 0) throw new Error(`could not clone ${url}: ${firstLine(clone.stderr)}`);
   return dir;
 }

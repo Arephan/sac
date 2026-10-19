@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parse } from "plist";
@@ -80,13 +80,16 @@ describe("sac restore", () => {
     ]);
     expect(state.configure["deploy@acme"].inputs).toEqual({ region: "eu-west-1", apiKey: FAKE.DEPLOY_KEY });
 
+    // Unloaded jobs wait in ~/.sac/jobs: launchd would load anything in LaunchAgents at the next login.
     for (const label of ["com.example.claude-digest", "com.example.script-job"]) {
       const want = parse(mapHome(readFileSync(join(a.home, "Library/LaunchAgents", `${label}.plist`), "utf8")));
-      expect(parse(readFileSync(join(b.home, "Library/LaunchAgents", `${label}.plist`), "utf8"))).toEqual(want);
+      expect(parse(readFileSync(join(b.home, ".sac/jobs", `${label}.plist`), "utf8"))).toEqual(want);
     }
+    expect(existsSync(join(b.home, "Library"))).toBe(false);
     expect(b.calls().filter((c) => c.bin === "launchctl")).toEqual([]);
     expect(out).toContain("launchctl bootstrap");
 
+    expect(await run({ target: darwin(b), loadJobs: true })).toBe(0);
     const repo2 = join(tmp, "repo2");
     await save({ dir: repo2, target: darwin(b) });
     const t1 = treeOf(repo);
@@ -100,6 +103,12 @@ describe("sac restore", () => {
   it("changes nothing the second time and needs no secrets for it", async () => {
     addDependencies(b);
     await run({ target: darwin(b), envFile });
+    b.clearCalls();
+    out = "";
+    expect(await run({ target: darwin(b) })).toBe(0);
+    expect(out).toContain("Everything already matches");
+    expect(b.calls().filter((c) => MUTATING(c.argv))).toEqual([]);
+    await run({ target: darwin(b), loadJobs: true });
     b.clearCalls();
     out = "";
     expect(await run({ target: darwin(b) })).toBe(0);
@@ -203,5 +212,38 @@ describe("sac restore", () => {
       ["bootstrap", `gui/${uid}`, join(b.home, "Library/LaunchAgents/com.example.claude-digest.plist")],
       ["bootstrap", `gui/${uid}`, join(b.home, "Library/LaunchAgents/com.example.script-job.plist")],
     ]);
+  });
+
+  it("never follows a symlink inside a setup repo", async () => {
+    const dir = makeLayer(join(tmp, "evil"), { name: "evil", files: [file("CLAUDE.md", "hi\n")] });
+    writeFileSync(join(tmp, "private.txt"), "not for you\n");
+    mkdirSync(join(dir, "claude/agents"), { recursive: true });
+    symlinkSync(join(tmp, "private.txt"), join(dir, "claude/agents/x.md"));
+    symlinkSync(tmp, join(dir, "claude/skills"));
+    expect(await restore({ sources: [dir], target: darwin(b), yes: true, io, interactive: false })).toBe(0);
+    expect(readdirSync(b.target.claudeDir)).toEqual(["CLAUDE.md"]);
+  });
+
+  it("never shows an old or new secret value in a settings diff, and keeps the file's mode", async () => {
+    const old = "old-password-value-123";
+    const fresh = "new-password-value-456";
+    makeLayer(join(tmp, "s"), { name: "s", files: [settingsFile({ env: { DB_PASSWORD: "{{secret:DB_PASSWORD}}", MODE: "a" } })] });
+    const sp = join(b.target.claudeDir, "settings.json");
+    writeFileSync(sp, JSON.stringify({ env: { DB_PASSWORD: old, MODE: "b" } }));
+    chmodSync(sp, 0o600);
+    writeFileSync(join(tmp, "s.env"), `DB_PASSWORD=${fresh}\n`);
+    expect(await restore({ sources: [join(tmp, "s")], target: darwin(b), yes: true, io, interactive: false, envFile: join(tmp, "s.env") })).toBe(0);
+    expect(out).toMatch(/~ settings\.json/);
+    expect(out).not.toContain(old);
+    expect(out).not.toContain(fresh);
+    expect(JSON.parse(readFileSync(sp, "utf8")).env).toEqual({ DB_PASSWORD: fresh, MODE: "a" });
+    expect(statSync(sp).mode & 0o777).toBe(0o600);
+  });
+
+  it("does not ask for secrets with --yes, even in a terminal", async () => {
+    addDependencies(b);
+    const asked: string[] = [];
+    expect(await run({ target: darwin(b), interactive: true, ask: async (n) => { asked.push(n); return undefined; } })).toBe(1);
+    expect(asked).toEqual([]);
   });
 });

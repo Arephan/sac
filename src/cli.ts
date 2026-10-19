@@ -101,7 +101,7 @@ export function program(io: Io, setCode: (n: number) => void): Command {
       try {
         const sources = (repos.length ? repos : [DEFAULT_REPO]).map((r) => (isGitUrl(r) ? r : absolute(r)));
         const prep = await prepare(sources, t, cli, o.envFile ? absolute(o.envFile) : undefined);
-        const r = await doctor(prep.setup, t, cli, prep.machine, { values: prep.values, sacHome: sacHome(), capturedClaude: prep.setup.captured?.claude });
+        const r = await doctor(prep.setup, t, cli, prep.machine, { values: prep.values, mask: prep.mask, sacHome: sacHome(), capturedClaude: prep.setup.captured?.claude });
         io.out(renderDoctor(r, pretty(t.claudeDir)));
         setCode(r.ok ? 0 : 1);
       } catch (e) {

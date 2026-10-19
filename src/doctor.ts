@@ -3,7 +3,8 @@ import { join } from "node:path";
 import fg from "fast-glob";
 import { DIR_ITEMS, IGNORE } from "./capture/files.js";
 import { claudeVersion, tool, type ClaudeCli } from "./claude-cli.js";
-import { describe, makePlan, type Machine } from "./plan.js";
+import { cronLine } from "./capture/jobs.js";
+import { agentPath, describe, makePlan, type Machine } from "./plan.js";
 import type { Setup, Target } from "./types.js";
 
 export type Level = "missing" | "differs" | "failing" | "warn" | "info";
@@ -21,6 +22,7 @@ export interface DoctorResult {
 export interface DoctorOptions {
   values: Record<string, string>;
   sacHome: string;
+  mask?: string[];
   /** Claude Code version the setup was captured with. */
   capturedClaude?: string | null;
   launchctl?: ClaudeCli;
@@ -50,7 +52,7 @@ const older = (a: string, b: string) => {
 export async function doctor(setup: Setup, t: Target, cli: ClaudeCli, m: Machine, opts: DoctorOptions): Promise<DoctorResult> {
   const findings: Finding[] = [];
   const add = (level: Level, message: string) => findings.push({ level, message });
-  const plan = await makePlan(setup, t, m, opts.values, { sacHome: opts.sacHome });
+  const plan = await makePlan(setup, t, m, opts.values, { sacHome: opts.sacHome, mask: opts.mask });
 
   for (const s of plan.steps) {
     if (s.skip) {
@@ -76,12 +78,23 @@ export async function doctor(setup: Setup, t: Target, cli: ClaudeCli, m: Machine
     }
   }
 
-  if (!t.configDir && t.platform === "darwin") {
+  // Jobs in a separate Claude home are never loaded, so loading is checked only for the real one.
+  if (!t.configDir) {
     const launchctl = opts.launchctl ?? tool(t, process.env.SAC_LAUNCHCTL_BIN ?? "launchctl", 30_000);
     const uid = opts.uid ?? process.getuid?.() ?? 0;
-    for (const j of setup.jobs) {
-      if (j.kind !== "launchd" || !plan.steps.some((s) => s.kind === "job" && s.key === j.label && s.op === "unchanged" && !s.skip)) continue;
-      if ((await launchctl.run(["print", `gui/${uid}/${j.label}`])).code !== 0) add("warn", `job ${j.label} is written but not loaded`);
+    let table: string | null = null;
+    for (const s of plan.steps) {
+      if (s.kind !== "job" || s.skip || s.op !== "unchanged" || !s.job) continue;
+      if (s.job.kind === "launchd") {
+        if (s.path !== agentPath(s.job, t)) add("missing", `job ${s.key} is written to ${s.path} but not installed; run sac restore --load-jobs`);
+        else if ((await launchctl.run(["print", `gui/${uid}/${s.key}`])).code !== 0) add("missing", `job ${s.key} is not loaded`);
+      } else {
+        if (table === null) {
+          const r = await tool(t, process.env.SAC_CRONTAB_BIN ?? "crontab", 30_000).run(["-l"]);
+          table = r.code === 0 ? r.stdout : "";
+        }
+        if (!table.split("\n").includes(cronLine(s.job))) add("missing", `job ${s.key} is not in the crontab`);
+      }
     }
   }
 

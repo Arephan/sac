@@ -8,7 +8,7 @@ import { readUserMcp } from "./capture/mcp.js";
 import { listMarketplaces, listPlugins, pluginOptions, type ClaudeCli, type InstalledPlugin, type KnownMarketplace } from "./claude-cli.js";
 import { mergeSettings } from "./layers.js";
 import { deepMapStrings, detokenize } from "./paths.js";
-import { extractSecrets, fillPlaceholders, fillText, findSecretSpans, placeholdersIn, scrub } from "./secrets.js";
+import { extractSecrets, fillPlaceholders, fillText, findSecretSpans, placeholdersIn, scrub, SECRET_KEY } from "./secrets.js";
 import type { JobDef, McpServer, Setup, Target, Warning } from "./types.js";
 
 export type StepKind = "file" | "settings" | "marketplace" | "plugin" | "plugin-settings" | "mcp" | "job";
@@ -33,6 +33,8 @@ export interface Step {
   enabled?: boolean;
   values?: Record<string, string>;
   config?: McpServer;
+  /** The MCP server's config before an update, put back if the new one cannot be added. */
+  previous?: McpServer;
   job?: JobDef;
 }
 
@@ -95,10 +97,19 @@ const tokens = <T>(v: T, t: Target): T => deepMapStrings(v, (s) => detokenize(s,
 /** A path inside the Claude folder that cannot climb out of it. */
 const safeRel = (p: string) => !isAbsolute(p) && !posix.normalize(p).startsWith("..") && !p.split("/").includes("..");
 
-export function jobPath(job: JobDef, t: Target, sacHome: string): string {
+export const agentPath = (job: JobDef, t: Target) => join(t.home, "Library", "LaunchAgents", `${job.label.replace(/[/\\]/g, "_")}.plist`);
+
+/**
+ * Where a job's file goes. launchd loads everything in LaunchAgents at login, so a launchd job is
+ * written there only when it is being loaded (or is there already); otherwise it waits in
+ * <SAC_HOME>/jobs. A separate Claude home keeps its jobs in <config-dir>/sac-jobs.
+ */
+export function jobPath(job: JobDef, t: Target, sacHome: string, load = false): string {
   const file = job.label.replace(/[/\\]/g, "_");
   if (job.kind === "cron") return join(sacHome, "jobs", `${file}.cron`);
-  return t.configDir ? join(t.configDir, "sac-jobs", `${file}.plist`) : join(t.home, "Library", "LaunchAgents", `${file}.plist`);
+  if (t.configDir) return join(t.configDir, "sac-jobs", `${file}.plist`);
+  const agent = agentPath(job, t);
+  return load || existsSync(agent) ? agent : join(sacHome, "jobs", `${file}.plist`);
 }
 
 const readPlist = (p: string): Record<string, unknown> | null => {
@@ -132,15 +143,15 @@ export function learnSecrets(setup: Setup, t: Target, m: Machine, sacHome: strin
   for (const p of setup.plugins) if (m.pluginInputs[p.id]) take(extractSecrets(p.settings, m.pluginInputs[p.id]));
   for (const j of setup.jobs) {
     if (j.kind !== "launchd") continue;
-    const cur = readPlist(jobPath(j, t, sacHome));
+    const cur = t.configDir ? readPlist(jobPath(j, t, sacHome)) : (readPlist(agentPath(j, t)) ?? readPlist(jobPath(j, t, sacHome)));
     if (cur) take(extractSecrets(plistFor(tokens(j, t)), cur));
   }
   return found;
 }
 
 /** Text safe to show: known secret values become ***, and anything that looks like a credential is masked. */
-export async function safeText(text: string, values: Record<string, string>): Promise<string> {
-  const s = scrub(text, Object.values(values));
+export async function safeText(text: string, mask: string[]): Promise<string> {
+  const s = scrub(text, mask);
   const spans = await findSecretSpans(s);
   let out = s;
   for (const [a, b] of spans.reverse()) out = `${out.slice(0, a)}***${out.slice(b)}`;
@@ -149,7 +160,24 @@ export async function safeText(text: string, values: Record<string, string>): Pr
 
 const needs = (names: string[]) => `needs secret ${names.join(", ")}`;
 
-export async function makePlan(setup: Setup, t: Target, m: Machine, values: Record<string, string>, opts: { sacHome: string }): Promise<Plan> {
+/** Settings for display: every value under env or headers, or under a credential-named key, becomes ***. */
+export function maskSettings<T>(v: T): T {
+  return deepMapStrings(v, (s, path) => {
+    const key = path[path.length - 1] ?? "";
+    const parent = path[path.length - 2];
+    return parent === "env" || parent === "headers" || SECRET_KEY.test(key) ? "***" : s;
+  });
+}
+
+export interface PlanOptions {
+  sacHome: string;
+  /** Every secret value known to this run, from any source; hidden in diffs. */
+  mask?: string[];
+  loadJobs?: boolean;
+}
+
+export async function makePlan(setup: Setup, t: Target, m: Machine, values: Record<string, string>, opts: PlanOptions): Promise<Plan> {
+  const mask = [...new Set([...(opts.mask ?? []), ...Object.values(values)])];
   const steps: Step[] = [];
   const warnings: Warning[] = [];
   const missing = new Set<string>();
@@ -157,7 +185,7 @@ export async function makePlan(setup: Setup, t: Target, m: Machine, values: Reco
     names.forEach((n) => missing.add(n));
     return { ...s, skip: needs(names), needs: names };
   };
-  const diffOf = async (name: string, a: string, b: string) => safeText(createTwoFilesPatch(`a/${name}`, `b/${name}`, a, b, "", "", { context: 2 }).split("\n").slice(2).join("\n"), values);
+  const diffOf = async (name: string, a: string, b: string) => safeText(createTwoFilesPatch(`a/${name}`, `b/${name}`, a, b, "", "", { context: 2 }).split("\n").slice(2).join("\n"), mask);
 
   // Files other than settings.json.
   for (const f of setup.files) {
@@ -220,11 +248,13 @@ export async function makePlan(setup: Setup, t: Target, m: Machine, values: Reco
       if (lost.length) steps.push(skipSecret({ ...base, exists: current !== null }, lost));
       else {
         const merged = mergeSettings(current ?? {}, value);
-        const text = `${JSON.stringify(merged, null, 2)}\n`;
-        const data = Buffer.from(text);
-        if (current && same(current, merged)) steps.push({ ...base, op: "unchanged", data, exists: true });
-        else if (!current) steps.push({ ...base, data, exists: false });
-        else steps.push({ ...base, op: "update", data, exists: true, diff: await diffOf("settings.json", `${JSON.stringify(current, null, 2)}\n`, text) });
+        const data = Buffer.from(`${JSON.stringify(merged, null, 2)}\n`);
+        const show = (v: unknown) => `${JSON.stringify(maskSettings(v), null, 2)}\n`;
+        // Keep the file's own mode; a new file that holds secrets is readable by its owner only.
+        const mode = current ? statSync(path).mode & 0o777 : placeholdersIn(desired).length ? 0o600 : 0o644;
+        if (current && same(current, merged)) steps.push({ ...base, op: "unchanged", data, mode, exists: true });
+        else if (!current) steps.push({ ...base, data, mode, exists: false });
+        else steps.push({ ...base, op: "update", data, mode, exists: true, diff: await diffOf("settings.json", show(current), show(merged)) });
       }
     }
   }
@@ -267,13 +297,13 @@ export async function makePlan(setup: Setup, t: Target, m: Machine, values: Reco
   for (const [name, s] of Object.entries(setup.mcp)) {
     const { value, missing: lost } = fillPlaceholders(tokens(s, t), values);
     const cur = m.mcp[name];
-    const base: Step = { kind: "mcp", key: name, op: !cur ? "add" : same(cur, value) ? "unchanged" : "update", config: value };
+    const base: Step = { kind: "mcp", key: name, op: !cur ? "add" : same(cur, value) ? "unchanged" : "update", config: value, previous: cur };
     steps.push(lost.length ? skipSecret(base, lost) : base);
   }
 
   // Jobs.
   for (const j of setup.jobs) {
-    const path = jobPath(j, t, opts.sacHome);
+    const path = jobPath(j, t, opts.sacHome, opts.loadJobs);
     const { value: job, missing: lost } = fillPlaceholders(tokens(j, t), values);
     const base: Step = { kind: "job", key: j.label, op: "add", path, job, mode: 0o644 };
     if (j.kind === "launchd" && t.platform !== "darwin") {

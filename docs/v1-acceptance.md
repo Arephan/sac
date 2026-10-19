@@ -3,7 +3,7 @@
 Run on the author's Mac (macOS, Claude Code 2.1.303). All writes went to a scratch folder; the
 real `~/.claude` was only read.
 
-1. **Test suite:** 71 tests in 11 files, all passing. Typecheck and build clean.
+1. **Test suite:** 75 tests in 10 files, all passing. Typecheck and build clean.
 2. **Saving the real setup:** `sac save --dry-run` and then `sac save <scratch>/repo` captured
    872 files, 2 MCP servers, 3 marketplaces, 8 plugins and 2 launchd jobs. No secret placeholders
    were needed. secretlint over the 875 text files in the repo found nothing, and none of the
@@ -23,6 +23,19 @@ real `~/.claude` was only read.
    `review.md` and `sac-org.md`, both deny rules are present, `model` is `opus`, and `docs` is
    `me`'s version; the plan reported the clash.
 5. **Jobs:** both jobs were captured as definitions with no secret values. A restore with `HOME`
-   set to a scratch folder (job dependencies stubbed there) wrote both plists to its
-   `Library/LaunchAgents` and printed the `launchctl bootstrap` commands. `launchctl` and
+   set to a scratch folder (job dependencies stubbed there) parked both plists in its
+   `.sac/jobs/`, left `Library/LaunchAgents` alone, and printed the commands that install and
+   load them. `launchctl` and
    `crontab` were replaced with a logging stub for the run, which recorded zero calls.
+
+## Review
+
+A fresh whole-branch review found nine problems; all are fixed with tests where a test can show
+them: setup repos are read without following symlinks; unloaded launchd jobs wait in
+`~/.sac/jobs/` instead of LaunchAgents (launchd loads that folder at login); settings diffs mask
+every env, header and credential-named value, old and new; an MCP update backs up the old config
+and puts it back if the new one fails; git layers are cached under a hashed name and cloned with
+`--`; `--yes` never prompts; `settings.json` keeps its mode (new files with secrets are 0600);
+`doctor` fails on jobs that are not loaded or not in the crontab; a `.env` inside a repo pulled
+from a git URL is ignored. After the fixes, steps 3 and 5 above were run again with the same
+results (37 s for the jobs run).

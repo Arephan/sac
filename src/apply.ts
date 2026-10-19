@@ -1,7 +1,7 @@
 import { chmodSync, copyFileSync, mkdirSync, writeFileSync } from "node:fs";
 import { dirname, join, relative, sep } from "node:path";
 import { tool, type ClaudeCli } from "./claude-cli.js";
-import type { Plan, Step } from "./plan.js";
+import { agentPath, type Plan, type Step } from "./plan.js";
 import { scrub } from "./secrets.js";
 import type { Target } from "./types.js";
 
@@ -112,8 +112,17 @@ export async function applyPlan(plan: Plan, t: Target, cli: ClaudeCli, opts: App
   }
 
   for (const s of live.filter((x) => x.kind === "mcp")) {
+    let saved = "";
+    if (s.op === "update" && s.previous) {
+      saved = join(opts.backupDir, "mcp", `${s.key.replace(/[^A-Za-z0-9._-]/g, "_")}.json`);
+      write(saved, Buffer.from(`${JSON.stringify(s.previous, null, 2)}\n`), 0o600);
+      backedUp.push(saved);
+    }
     if (s.op === "update" && !(await run(s, ["mcp", "remove", s.key, "--scope", "user"]))) continue;
     if (await run(s, ["mcp", "add-json", "--scope", "user", s.key, JSON.stringify(s.config)])) done(s);
+    else if (s.previous && (await cli.run(["mcp", "add-json", "--scope", "user", s.key, JSON.stringify(s.previous)])).code !== 0) {
+      results.push({ step: s, status: "failed", message: `the old ${s.key} could not be put back either; its config is in ${saved}` });
+    }
   }
 
   for (const s of live.filter((x) => x.kind === "job")) {
@@ -130,7 +139,12 @@ export async function applyPlan(plan: Plan, t: Target, cli: ClaudeCli, opts: App
     }
     if (job.kind === "launchd") {
       if (!opts.loadJobs) {
-        loadCommands.push(`launchctl bootstrap gui/${uid} ${shellQuote(s.path!)}`);
+        const agent = agentPath(job, t);
+        loadCommands.push(
+          s.path === agent
+            ? `launchctl bootstrap gui/${uid} ${shellQuote(agent)}`
+            : `cp ${shellQuote(s.path!)} ${shellQuote(agent)} && launchctl bootstrap gui/${uid} ${shellQuote(agent)}`,
+        );
         done(s);
         continue;
       }

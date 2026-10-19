@@ -5,7 +5,7 @@ import { confirm as askConfirm, password } from "@inquirer/prompts";
 import { applyPlan, type ApplyResult } from "./apply.js";
 import { isText } from "./capture/files.js";
 import { claudeCli, type ClaudeCli } from "./claude-cli.js";
-import { loadLayers, mergeLayers } from "./layers.js";
+import { isGitUrl, loadLayers, mergeLayers } from "./layers.js";
 import { changes, describe, learnSecrets, makePlan, readMachine, renderPlan, skips, type Plan } from "./plan.js";
 import { placeholdersIn } from "./secrets.js";
 import { secretsFrom } from "./secrets-input.js";
@@ -41,11 +41,15 @@ export function secretNames(setup: Setup): string[] {
 export async function prepare(sources: string[], t: Target, cli: ClaudeCli, envFile: string | undefined) {
   const layers = await loadLayers(sources, { cacheDir: join(sacHome(), "cache") });
   const { setup, warnings } = mergeLayers(layers);
-  const file = envFile ?? join(layers[layers.length - 1].dir, ".env");
+  const top = layers[layers.length - 1];
+  // A .env inside a repo pulled from a git URL is someone else's file: only a local top layer's counts.
+  const file = envFile ?? (isGitUrl(top.source) ? null : join(top.dir, ".env"));
   if (envFile && !existsSync(envFile)) throw new UsageError(`env file ${envFile} does not exist`);
   const machine = await readMachine(setup, t, cli);
-  const values = { ...learnSecrets(setup, t, machine, sacHome()), ...secretsFrom(secretNames(setup), { envFile: file }) };
-  return { layers, setup, warnings, machine, values };
+  const learned = learnSecrets(setup, t, machine, sacHome());
+  const given = secretsFrom(secretNames(setup), { envFile: file });
+  const values = { ...learned, ...given };
+  return { layers, setup, warnings, machine, values, mask: [...Object.values(learned), ...Object.values(given)] };
 }
 
 export class UsageError extends Error {}
@@ -101,24 +105,25 @@ export async function restore(o: RestoreOptions): Promise<number> {
     throw e;
   }
   const { layers, setup, machine, values } = prep;
-  const plan0 = await makePlan(setup, t, machine, values, { sacHome: sacHome() });
-  let plan = plan0;
-  if (o.interactive && !o.dryRun && plan.missing.length) {
+  const planOpts = { sacHome: sacHome(), mask: prep.mask, loadJobs: !!o.loadJobs };
+  let plan = await makePlan(setup, t, machine, values, planOpts);
+  if (o.interactive && !o.yes && !o.dryRun && plan.missing.length) {
     io.out(`This setup uses ${plural(plan.missing.length, "secret")} that ${plan.missing.length === 1 ? "is" : "are"} not set. Leave one empty to skip what needs it.\n`);
     const ask = o.ask ?? ((name: string) => password({ message: name, mask: "*" }));
     for (const name of plan.missing) {
       const v = await ask(name);
       if (v) values[name] = v;
     }
-    plan = await makePlan(setup, t, machine, values, { sacHome: sacHome() });
+    plan = await makePlan(setup, t, machine, values, planOpts);
   }
   plan.warnings.unshift(...prep.warnings);
 
   const where = pretty(t.claudeDir);
   const from = layers.map((l) => l.name).join(" + ");
-  if (!changes(plan).length && !skips(plan).length && !plan.warnings.length) {
+  if (!changes(plan).length && !skips(plan).length) {
     io.out(`Everything already matches ${from} in ${where}.\n`);
-    return 0;
+    if (plan.warnings.length) io.out(`Notes\n${plan.warnings.map((w) => `  ${w.message}\n`).join("")}`);
+    return exitCode(plan, null, !!o.allowMissing);
   }
   io.out(`${o.dryRun ? "Would restore" : "Restoring"} ${from} into ${where}:\n${renderPlan(plan)}`);
   if (o.dryRun) return 0;
@@ -137,7 +142,7 @@ export async function restore(o: RestoreOptions): Promise<number> {
   const applied = await applyPlan(plan, t, cli, {
     backupDir: join(sacHome(), "backups", stamp(o.now ?? new Date())),
     loadJobs: !!o.loadJobs,
-    values,
+    values: { ...values, ...Object.fromEntries(prep.mask.map((v, i) => [`#${i}`, v])) },
   });
   io.out(report(applied, t));
   return exitCode(plan, applied, !!o.allowMissing);
