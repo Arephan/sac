@@ -1,8 +1,0 @@
-# Terms that identify you. `sac lint` fails if any appears in the shareable tree (src/, examples/,
-# docs/, templates/). One per line, case-insensitive, matched as whole words. This file stays in your
-# instance folder and is never shared.
-#
-# your-first-name
-# your-last-name
-# your-company
-# your-handle

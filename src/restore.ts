@@ -61,7 +61,7 @@ function exitCode(plan: Plan, applied: ApplyResult | null, allowMissing: boolean
   return secretGaps && !allowMissing ? 1 : 0;
 }
 
-function report(r: ApplyResult): string {
+function report(r: ApplyResult, t: Target): string {
   const lines: string[] = [];
   const done = r.results.filter((x) => x.status === "done").length;
   const failed = r.results.filter((x) => x.status === "failed");
@@ -69,6 +69,8 @@ function report(r: ApplyResult): string {
   lines.push(`Done: ${plural(done, "change")} applied, ${skipped.length} skipped, ${failed.length} failed.`);
   for (const f of failed) lines.push(`  ! ${describe(f.step)}: ${f.message}`);
   if (r.backedUp.length) lines.push(`Backed up ${plural(r.backedUp.length, "file")} it overwrote.`);
+  const parked = t.configDir ? r.results.filter((x) => x.status === "done" && x.step.job?.kind === "launchd") : [];
+  if (parked.length) lines.push("", `${plural(parked.length, "launchd job")} written to ${pretty(join(t.configDir!, "sac-jobs"))}; jobs restored into a separate Claude home are never loaded.`);
   if (r.loadCommands.length) {
     lines.push("", "Jobs were written but not loaded. To load them:");
     for (const c of r.loadCommands) lines.push(`  ${c}`);
@@ -137,6 +139,6 @@ export async function restore(o: RestoreOptions): Promise<number> {
     loadJobs: !!o.loadJobs,
     values,
   });
-  io.out(report(applied));
+  io.out(report(applied, t));
   return exitCode(plan, applied, !!o.allowMissing);
 }

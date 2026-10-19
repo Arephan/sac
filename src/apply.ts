@@ -124,6 +124,10 @@ export async function applyPlan(plan: Plan, t: Target, cli: ClaudeCli, opts: App
       continue;
     }
     const job = s.job!;
+    if (job.kind === "launchd" && t.configDir) {
+      done(s);
+      continue;
+    }
     if (job.kind === "launchd") {
       if (!opts.loadJobs) {
         loadCommands.push(`launchctl bootstrap gui/${uid} ${shellQuote(s.path!)}`);

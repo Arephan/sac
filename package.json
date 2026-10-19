@@ -4,7 +4,7 @@
   "description": "Save your Claude Code setup as a git repo and bring it back anywhere",
   "type": "module",
   "bin": {
-    "sac": "dist/cli.js"
+    "sac": "dist/bin.js"
   },
   "files": [
     "dist"
@@ -15,7 +15,8 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "test": "vitest run",
-    "typecheck": "tsc -p tsconfig.json --noEmit"
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "prepare": "tsc -p tsconfig.json"
   },
   "license": "MIT",
   "dependencies": {

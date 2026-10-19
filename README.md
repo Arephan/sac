@@ -1,201 +1,119 @@
-# setup-as-code
+# setup-as-code (`sac`)
 
-Terraform for a personal AI assistant. One YAML file describes everything your assistant is and
-does: who it acts for, which models it uses, the rules it follows, its tools, its scheduled loops,
-where it talks, what it works on, where its state lives, and what it must never do. A single
-binary, `sac`, keeps that file and your machine honest with each other.
-
-```
-sac import    read the machine (read-only)              -> setup.yaml
-sac validate  schema, duplicate ids, cross-references
-sac plan      setup.yaml vs machine, item by item        -> printed diff, writes nothing
-sac verify    plan + safety policies (hard = exit 1)
-sac apply     render config from setup.yaml             -> out/<instance>/ only
-sac apply --live --yes   rebuild a home from setup.yaml, with backups, nothing loaded
-sac lint      prove the shareable parts hold no secrets or personal data
-```
-
-No runtime, no daemon, no network. Claude Code is the first agent with importers; the manifest
-itself is agent-neutral.
-
-Fast enough to run on every prompt. Measured on the author's laptop (Apple M1 Pro) against a real
-setup with 216 rules, about 500 memory files, 60 launchd jobs and 10 MCP servers: `sac import
---dry-run` 0.1 s warm, 0.5 s cold; `verify` 0.3 s; the Node prototype took 1.8 s.
-
-## Why
-
-Everyone who runs an assistant for real ends up with a pile of `CLAUDE.md` files, hooks, skills,
-MCP configs, memory directories and launchd jobs that nobody can reproduce, share or audit. Rules
-that matter ("never spend money", "never post from the work account") live in prose with nothing
-checking them. `sac` makes the setup a file, diffs the file against reality, and turns the rules
-that matter into checks that fail a build.
-
-## Install
-
-```bash
-# from source (needs Rust, https://rustup.rs)
-git clone https://github.com/Arephan/setup-as-code.git && cd setup-as-code
-cargo install --path .            # puts `sac` in ~/.cargo/bin
-# or: scripts/install.sh           # builds and copies to ~/.local/bin
-```
-
-The release workflow builds macOS (Apple silicon and Intel) and Linux x86_64 binaries for every
-`v*` tag and attaches them to the GitHub release.
-
-## Ten-minute quickstart
-
-```bash
-# 1. scaffold your instance: setup.yaml, policies.yaml, overrides.yaml, lint-denylist.txt
-sac init instance/me
-
-# 2. check the starter is valid
-sac validate -i instance/me
-
-# 3. see what your machine actually has, without changing anything
-sac import -i instance/me --dry-run      # counts only
-sac plan   -i instance/me                # starter file vs your machine
-
-# 4. adopt the machine's real state into setup.yaml
-#    Put hand-written facts in instance/me/overrides.yaml first, e.g. which launchd label
-#    prefixes are yours under import.options.launchd.managed_prefixes.
-sac import -i instance/me
-
-# 5. write your rules and policies, then verify (exit 1 if a hard policy fails)
-$EDITOR instance/me/policies.yaml
-sac verify -i instance/me
-
-# 6. render config to look at or copy by hand
-sac apply -i instance/me && ls out/me
-```
-
-Want to try it without touching your real home? Add `--home /tmp/empty-home` (an existing folder)
-to any import, plan, verify or apply command and the importers read that folder instead. If your
-instance lives outside `./instance/`, pass `--instance-root <dir>` (the folder that contains your
-instance folders) to `lint` so it learns your terms. `scripts/demo-roundtrip.sh`
-does the whole loop in a temp directory: capture home A, rebuild it into empty home B, show that
-B now matches.
-
-## Framework vs instance
-
-The repository is split in two, and the split is enforced by the lint.
-
-| | Framework (shareable) | Instance (yours, private) |
-|---|---|---|
-| Where | `src/`, `schema/`, `templates/`, `examples/`, `docs/` | `instance/<name>/` (git-ignored) or any folder you pass with `-i` |
-| What | the binary, schema, layer definitions, importers, policy checks, templates | `setup.yaml`, `overrides.yaml`, `policies.yaml`, `lint-denylist.txt`, custom `importers/` and `checks/` |
-| Holds personal data? | Never. `sac lint` fails if it does. | Yes, by reference: paths, account roles, secret *locations* (never values). |
-
-The framework knows nothing about any person. Paths are `~/...` or `${env:HOME}`; accounts are
-named by role; machine-specific choices (which launchd labels are yours, which CLIs to probe)
-are importer options set in the instance.
-
-## Commands
-
-| command | reads | writes | exit code |
-|---|---|---|---|
-| `init <dir> [--name n] [--force]` | templates | `<dir>/` (refuses to scaffold inside live config) | 1 on clash or protected dir |
-| `import [-i dir] [--home h] [--dry-run]` | machine (read-only), `overrides.yaml` | `<dir>/setup.yaml` | 1 if the result fails the schema |
-| `validate [-i dir]` | instance | nothing | 1 if invalid |
-| `plan [-i dir] [--home h] [--json] [-v]` | instance + machine | nothing | 0 |
-| `verify [-i dir] [--home h] [--fail-on-drift] [--json]` | instance + machine | nothing | 1 hard failure, 2 drift with the flag |
-| `apply [-i dir] [--out o]` | instance + machine (for the plan in report.md) | `<out>/<instance>/` only | 1 if invalid or a hard policy fails |
-| `apply --live --yes [--home h] [--force]` | instance + machine | the home's live config, after backups | 1 on refusal |
-| `lint [paths...] [--instance-root dir]` | files | nothing | 1 on any finding |
-| `redact -i dir --out d` | instance | `d/setup.yaml`, a shape-only copy | 1 if the result is invalid |
-| `layers`, `importers` | | | 0 |
-
-Instance resolution: `-i`, then `$SAC_INSTANCE`, then `./setup.yaml`, then the only folder under
-`./instance/`.
-
-## What `apply --live` does, exactly
-
-Rendering to `out/` never touches live config. `--live` additionally merges into a home:
-
-- `~/.claude/settings.json`: `permissions.allow|deny|ask`, `defaultMode`, `enabledPlugins`,
-  `model` and `effortLevel` come from the manifest. `hooks` and `deniedMcpServers` are written only
-  when the file lacks them or with `--force`, because the manifest keeps just a hook's command and
-  a denial's name. Every other key and every `env` value is kept.
-- `~/.claude.json`: missing MCP servers are added. An existing server keeps its `env` and
-  `headers` values; its command, args and URL change only with `--force`. Denied or disabled
-  servers are never added.
-- `~/Library/LaunchAgents/<label>.plist` for every managed launchd loop with a program: written
-  when missing, regenerated from the manifest only with `--force` (keys the manifest does not
-  carry are dropped then); disabled loops go under `disabled/`. Nothing is ever loaded. The
-  `launchctl bootstrap` commands are printed for you to run.
-- `~/.claude/setup-as-code/RULES.md`, `setup.lock.json`, `report.md`.
-- Before the first write, every file that will change is copied to
-  `~/.setup-as-code/backups/<timestamp>/`.
-
-Skills, memory files and plugin installs are things the manifest points at, not things it can
-recreate; they stay where they are. A file whose content would contain `<redacted>` is skipped
-and reported. Quit Claude Code before a live run; it writes `~/.claude.json` itself.
-
-## Plugins: importers and checks in any language
-
-Any executable in `<instance>/importers/` or `<instance>/checks/` is a plugin.
-
-An importer answers `describe` (prints `{"id","layers","description"}`), `detect` (exit 0 when it
-applies; env `SAC_HOME`, `SAC_REAL_HOME`) and `run` (reads its options as JSON on stdin, prints a
-fragment of `setup.yaml`). A check answers `describe` (`{"id","doc"}`) and `run` (reads
-`{"setup","params","ctx"}` on stdin, prints `{"status","message","evidence"}`). Working examples:
-`examples/minimal/importers/todo-md` and `examples/minimal/checks/max-enabled-loops`.
-
-## Safety contract
-
-Enforced in code and covered by tests, not just promised:
-
-- Importers see the machine only through a context that refuses to open secret-looking files
-  (`*token*`, `*secret*`, `*_key`, `.env`, `auth.json`, keys, cookies) and runs only `launchctl
-  list|print-disabled`, `crontab -l`, `sw_vers` and `uname`; launchd plists and `.git/config` are
-  parsed in-process. There is no load, unload, bootstrap or kill anywhere in the binary.
-- Env vars and HTTP headers are imported as names only. Secret-shaped strings are dropped, and
-  `${env:NAME}` is never expanded inside a key that names a credential.
-- `apply` without `--live` writes only below the out root and refuses an out root inside
-  `~/.claude`, `~/Library/LaunchAgents` or other live config.
-- Nothing calls a paid API, posts to a chat or sends email.
-- `sac lint` fails if any term from your instance (names, handles, workspaces, the home user),
-  any email, phone number, home path or chat id appears in the shareable tree.
-
-`scripts/parity.sh` compares imports against the Node prototype this binary replaced (tag
-`v0.2.0`); all thirty collections agreed on the synthetic home used by the test suite. `cargo test` runs the unit suite plus end-to-end tests over a synthetic home: import counts,
-drift detection, exit codes, rendered plists checked with `plutil -lint`, the lint against
-planted canaries, and a full round trip through `apply --live` into an empty home.
-
-## Layout
+A Claude Code setup is spread all over: `CLAUDE.md` plus whatever it imports, rules, skills,
+agents, commands, hook scripts, `settings.json`, MCP servers buried in `~/.claude.json`, plugins
+and the marketplaces they come from, maybe a launchd job that runs `claude -p` overnight. Moving
+to a new laptop means rebuilding it by hand. `sac` saves all of that into a git repo and puts it
+back somewhere else.
 
 ```
-src/
-  main.rs cli.rs             the binary
-  core.rs                    instance resolution, desired state, import orchestration
-  ctx.rs                     read-only machine context, exec allowlist, scrubbing
-  importers/                 claude-settings, claude-mcp, claude-plugins, claude-skills,
-                             claude-instructions, claude-memory, launchd, cron, infra,
-                             file-state, external (executable plugins)
-  policy/                    check engine, nine built-in checks, external checks
-  plan.rs apply.rs live.rs   diff, render, live merge with backups
-  lint.rs redact.rs init.rs
-schema/setup.schema.json     the manifest schema (draft-07)
-templates/                   what `init` scaffolds
-examples/minimal             a small hand-written setup with one importer and one check plugin
-examples/large-redacted      shape-only redaction of a real, large setup (counts and kinds only)
-docs/                        layers.md importers.md policies.md safety.md
-instance/                    your data (git-ignored)
+sac save        # this machine into ~/my-claude, committed
+sac restore     # ~/my-claude back onto this machine (shows the plan, then asks)
+sac doctor      # how this machine differs from the repo
 ```
 
-## Docs
+Status: 1.0.0-dev. macOS is what I use every day; Linux runs in CI but I haven't lived on it.
 
-- [docs/layers.md](docs/layers.md): every layer and its fields
-- [docs/importers.md](docs/importers.md): built-in importers and the plugin protocol
-- [docs/policies.md](docs/policies.md): hard vs standing rules, policy checks, custom checks
-- [docs/safety.md](docs/safety.md): secrets, the lint, what is never touched
-- [docs/design.md](docs/design.md): how it is built, the safety contract in detail, differences from the prototype
+## Try it
 
-## Status
+Needs Node 22+.
 
-v0.3, early. Importers cover Claude Code today, plus launchd, cron and git repos. Adapters for
-other agents are the obvious next step; the manifest and the policy checks do not depend on the
-agent. Issues and PRs welcome.
+```
+npx github:Arephan/setup-as-code save --dry-run
+```
 
-## License
+Or clone, `npm install && npm run build`, and use `node dist/bin.js`.
 
-MIT.
+If you want to see what a restore would do without risking your real config, restore into a
+throwaway Claude home:
+
+```
+sac restore ~/my-claude --config-dir /tmp/claude-test
+CLAUDE_CONFIG_DIR=/tmp/claude-test claude plugin list
+```
+
+## What gets saved
+
+| Repo path | What's in it |
+|---|---|
+| `claude/` | `CLAUDE.md` and its imports, `rules/`, `skills/`, `agents/`, `commands/`, `output-styles/`, `settings.json`, `keybindings.json`, and the scripts hooks and the status line call |
+| `mcp.json` | user-scope MCP servers, and nothing else from `~/.claude.json` |
+| `plugins.json` | marketplaces, user-scope plugins, on/off, plugin settings |
+| `jobs/` | launchd agents and crontab lines that run `claude` (`--job <label>` adds one that doesn't) |
+| `.env.example` | names of the secrets the setup needs |
+
+Not saved: credentials, sessions, history, project memory, caches, `settings.local.json`. If
+something outside `~/.claude` matters (a note in your home folder that `CLAUDE.md` imports, the
+script a job runs), `save` tells you about it but doesn't copy it.
+
+Home paths are stored as `{{home}}` / `{{claude}}` so the repo still works under another user name.
+Any `~` you typed yourself stays a `~`.
+
+## Secrets
+
+Tokens in MCP env, headers or args, in `settings.json` env, in plugin settings, in job env, or
+sitting in the text of a saved file are swapped for `{{secret:NAME}}`. Only the name lands in the
+repo. After writing, `save` runs secretlint over its own output and won't commit if it finds
+anything.
+
+On restore, values come from your environment first, then `--env-file` (default: `.env` next to
+the repo, which is git-ignored). If the machine already has the item, `sac` reads the value from
+there (handy: a second `restore` needs no secrets). Whatever is still missing gets a
+hidden prompt. Under `--yes` there's no prompt: the item is skipped and the exit code is 1, unless
+you pass `--allow-missing`.
+
+## Restore details
+
+Arguments are folders or git URLs. Overwritten files are copied to `~/.sac/backups/<time>/` first.
+Your existing `settings.json` is merged rather than replaced (lists combine, keys you have that the
+repo doesn't are kept). Plugins and MCP servers go through `claude plugin` and `claude mcp`; `sac`
+doesn't write `~/.claude.json` itself. It also never deletes anything. Run it twice and the
+second run says everything already matches.
+
+Jobs get written but stay unloaded unless you add `--load-jobs`. With `--config-dir` they go to
+`<dir>/sac-jobs/` and can't be loaded at all.
+
+## Layering, for teams
+
+```yaml
+# sac.yaml
+version: 1
+name: me
+extends:
+  - https://github.com/acme/claude-base.git
+```
+
+Or name several repos on the command line, base first: `sac restore acme-base ~/my-claude`.
+
+The top layer's `CLAUDE.md` is your `CLAUDE.md`. A lower layer's ends up at
+`rules/sac-<layer>.md`, which Claude Code picks up by itself. Everything else combines by path or
+name, the later layer wins a clash, and the plan tells you when that happened. `settings.json` is
+deep-merged, so every layer's `permissions.deny` survives. None of this is enforcement; for
+settings people must not override, use Claude Code's managed settings.
+
+## doctor
+
+Lists what's missing or different: files, plugins in the wrong state, MCP servers that are gone or
+failing in `claude mcp list`, secrets it can't find, unloaded jobs, missing dependencies, and a
+Claude Code older than the one the setup came from. Things you have that no layer has are shown
+too, but they don't fail the check.
+
+## Known gaps
+
+- Claude Code only. No Codex or Cursor yet.
+- TODO: a GIF of save/restore up top.
+- `claude mcp add-json` takes the server config as an argument, so a filled-in token is briefly
+  visible in the process list while it runs.
+- Binary plists it can't parse are skipped with a note.
+- `sac` never pushes. Keep the repo private; it has your prompts and permissions in it even with
+  the secrets removed.
+
+## Development
+
+```
+npm install
+npm test           # every test uses a scratch HOME and fake claude/launchctl/crontab
+npm run typecheck
+```
+
+Design: [docs/v1-design.md](docs/v1-design.md). MIT license.

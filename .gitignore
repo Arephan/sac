@@ -1,12 +1,12 @@
+dist/
+node_modules/
+.vitest/
+.env
+# Leftovers from the v0 tree and local working notes; never part of the package.
+instance/
+target*/
 out/
-# Instance data is personal. Each person keeps their own instance/<name>/ out of the shared framework.
-instance/*
-!instance/README.md
-target/
+ts/
 .superpowers/
 .worktrees/
 docs/superpowers/
-target*/
-ts/dist/
-ts/node_modules/
-.vitest/
