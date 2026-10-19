@@ -1,5 +1,7 @@
 import { Command, CommanderError } from "commander";
+import { isGitUrl } from "./layers.js";
 import { targetFor } from "./paths.js";
+import { restore } from "./restore.js";
 import { save, type SaveResult } from "./save.js";
 import { absolute, plural, pretty, stdio, table, type Io } from "./ui.js";
 
@@ -59,6 +61,31 @@ export function program(io: Io, setCode: (n: number) => void): Command {
       if (r.dryRun && r.diff) io.out(`${r.diff}\n`);
       io.out(saveReport(r));
       setCode(0);
+    });
+
+  p.command("restore")
+    .description(`bring a saved setup back onto this machine (default ${DEFAULT_REPO}); later repos override earlier ones`)
+    .argument("[repos...]", "setup repo folders or git URLs")
+    .option("--dry-run", "show the plan, change nothing")
+    .option("-y, --yes", "apply without asking; secrets that are not set skip what needs them")
+    .option("--config-dir <dir>", "restore into a separate Claude home (like CLAUDE_CONFIG_DIR); jobs go to <dir>/sac-jobs")
+    .option("--env-file <file>", "secret values (default: .env beside the top repo)")
+    .option("--allow-missing", "exit 0 even when items were skipped for missing secrets")
+    .option("--load-jobs", "load the written jobs with launchctl or crontab")
+    .action(async (repos: string[], o: { dryRun?: boolean; yes?: boolean; configDir?: string; envFile?: string; allowMissing?: boolean; loadJobs?: boolean }) => {
+      setCode(
+        await restore({
+          sources: (repos.length ? repos : [DEFAULT_REPO]).map((r) => (isGitUrl(r) ? r : absolute(r))),
+          target: targetFor({ configDir: o.configDir ? absolute(o.configDir) : null }),
+          io,
+          interactive: !!process.stdin.isTTY && !!process.stdout.isTTY,
+          yes: o.yes,
+          dryRun: o.dryRun,
+          envFile: o.envFile ? absolute(o.envFile) : undefined,
+          allowMissing: o.allowMissing,
+          loadJobs: o.loadJobs,
+        }),
+      );
     });
 
   return p;
