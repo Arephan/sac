@@ -1,7 +1,9 @@
 import { Command, CommanderError } from "commander";
 import { isGitUrl } from "./layers.js";
 import { targetFor } from "./paths.js";
-import { restore } from "./restore.js";
+import { claudeCli } from "./claude-cli.js";
+import { doctor, renderDoctor } from "./doctor.js";
+import { prepare, restore, sacHome, UsageError } from "./restore.js";
 import { save, type SaveResult } from "./save.js";
 import { absolute, plural, pretty, stdio, table, type Io } from "./ui.js";
 
@@ -86,6 +88,27 @@ export function program(io: Io, setCode: (n: number) => void): Command {
           loadJobs: o.loadJobs,
         }),
       );
+    });
+
+  p.command("doctor")
+    .description(`check this machine against a saved setup (default ${DEFAULT_REPO})`)
+    .argument("[repos...]", "setup repo folders or git URLs")
+    .option("--config-dir <dir>", "check a separate Claude home (like CLAUDE_CONFIG_DIR)")
+    .option("--env-file <file>", "secret values (default: .env beside the top repo)")
+    .action(async (repos: string[], o: { configDir?: string; envFile?: string }) => {
+      const t = targetFor({ configDir: o.configDir ? absolute(o.configDir) : null });
+      const cli = claudeCli(t);
+      try {
+        const sources = (repos.length ? repos : [DEFAULT_REPO]).map((r) => (isGitUrl(r) ? r : absolute(r)));
+        const prep = await prepare(sources, t, cli, o.envFile ? absolute(o.envFile) : undefined);
+        const r = await doctor(prep.setup, t, cli, prep.machine, { values: prep.values, sacHome: sacHome(), capturedClaude: prep.setup.captured?.claude });
+        io.out(renderDoctor(r, pretty(t.claudeDir)));
+        setCode(r.ok ? 0 : 1);
+      } catch (e) {
+        if (!(e instanceof UsageError)) throw e;
+        io.err(`sac: ${e.message}\n`);
+        setCode(2);
+      }
     });
 
   return p;
